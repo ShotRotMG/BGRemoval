@@ -36,10 +36,10 @@ def ensure(pkgs, test):
 
 
 def _t1():
-    import rembg, onnxruntime, PIL, pillow_heif  # noqa
+    import rembg, onnxruntime, PIL, pillow_heif, cv2  # noqa
 
 
-ensure(["rembg[cpu]", "pillow", "pillow-heif"], _t1)
+ensure(["rembg[cpu]", "pillow", "pillow-heif", "opencv-python-headless"], _t1)
 
 import pillow_heif
 from PIL import Image, ImageCms, ImageOps
@@ -64,6 +64,62 @@ def mask_from_white(img, tol=12):
     from PIL import ImageChops
     diff = ImageChops.difference(img, Image.new("RGB", img.size, "white")).convert("L")
     return diff.point(lambda v: 255 if v > tol else 0)
+
+
+def local_backdrop(lum, product):
+    import numpy as np
+    """Estimate backdrop brightness everywhere (also behind the product)."""
+    import cv2
+    h, w = lum.shape
+    k = 16
+    sl = cv2.resize(lum, (w // k, h // k), interpolation=cv2.INTER_AREA)
+    sp = cv2.resize(product.astype(np.uint8) * 255, (w // k, h // k), interpolation=cv2.INTER_NEAREST)
+    sp = cv2.dilate(sp, np.ones((9, 9), np.uint8))
+    bg = cv2.inpaint(np.clip(sl, 0, 255).astype(np.uint8), sp, 15, cv2.INPAINT_TELEA).astype(np.float32)
+    bg = cv2.GaussianBlur(bg, (0, 0), 3)
+    return cv2.resize(bg, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
+def combine_masks(img, best, fast):
+    """best/fast: L masks from the two AI models. Best is cleaner but can miss white parts on a
+    light backdrop (white toe caps, rubber sidewalls). Adds back regions only the fast model kept
+    when it's confident and they aren't shadows (shadows are much darker than the backdrop)."""
+    import cv2
+    import numpy as np
+    a = np.asarray(img).astype(np.float32)
+    lum = a @ np.array([0.299, 0.587, 0.114], np.float32)
+    B = np.asarray(best).astype(np.float32)
+    F = np.asarray(fast).astype(np.float32)
+    union = (B > 128) | (F > 128)
+    bg = local_backdrop(lum, union)
+    extra = (F > 128) & (B < 128)                      # parts only the fast model kept
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(extra.astype(np.uint8), 8)
+    if n <= 1:
+        return best, 0
+    near = cv2.dilate((B > 128).astype(np.uint8), np.ones((15, 15), np.uint8)) > 0
+    touch = np.zeros(n, bool)
+    touch[np.unique(lab[near & extra])] = True
+    keep = np.zeros(n, bool)
+    for i in np.nonzero(touch & (stats[:, cv2.CC_STAT_AREA] >= 0.0005 * lum.size))[0]:
+        if i == 0:
+            continue
+        m = lab == i
+        not_shadow = np.median(lum[m] - bg[m]) > -25      # shadows are much darker than the backdrop
+        confident = (F[m] > 250).mean() > 0.5              # fast model is sure it's product
+        keep[i] = not_shadow and confident
+    add = keep[lab]
+    out = np.where(add, np.maximum(B, F), B)
+    return Image.fromarray(out.astype(np.uint8)), int(add.sum())
+
+
+def ai_mask(img, s, sessions):
+    """Cut-out mask for img using the quality setting's model(s)."""
+    from rembg import remove
+    if s.get("quality") == "fast":
+        return remove(img, session=sessions["fast"], only_mask=True, post_process_mask=True)
+    best = remove(img, session=sessions["best"], only_mask=True)
+    fast = remove(img, session=sessions["fast"], only_mask=True)
+    return combine_masks(img, best, fast)[0]
 
 
 def compose(img, mask, W, H, margin):
@@ -127,7 +183,7 @@ out.mkdir(exist_ok=True)
 print(f"Processing {len(files)} photo(s) in {src}")
 print("Loading background-removal model...")
 print("(Best quality downloads ~1 GB the first time.)" if QUALITY == "best" else "")
-session = make_session(QUALITY)
+sessions = {q: make_session(q) for q in (["best", "fast"] if QUALITY == "best" else ["fast"])}
 
 ok, too_small, bad_names = 0, [], []
 for i, f in enumerate(files, 1):
@@ -135,7 +191,7 @@ for i, f in enumerate(files, 1):
     try:
         img = ImageOps.exif_transpose(Image.open(f))
         img = to_srgb(img.convert("RGB")).convert("RGB")
-        mask = remove(img, session=session, only_mask=True, post_process_mask=(QUALITY == "fast"))
+        mask = ai_mask(img, {"quality": QUALITY}, sessions)
         canvas, scale = compose(img, mask, W, H, MARGIN)
         if canvas is None:
             print("no product found, skipped")
