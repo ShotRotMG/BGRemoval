@@ -46,13 +46,14 @@ Open it any time with the **Review…** button; it starts at the photo selected 
 For anything the AI gets wrong, click **✎ Touch up…** in the review window (or press **T**):
 
 - **Erase (E)** paints away background the AI kept (shadows, bits of the floor); **Restore (R)** paints back parts of the shoe it cut off
+- **Heal (H)** removes wear on samples (scuffs, dirt, stains, creasing on white outsoles and socks): paint over the mark and AI fills it in to match the surrounding material. Uses the [LaMa](https://github.com/advimman/lama) inpainting model (Apache-2.0, ~208 MB one-time download, checksum-verified). Heal small areas at a time and zoom in for best results; check that logos, stitching and tread patterns stay intact so the photo still shows the real product
 - **Brush** size (or **[** / **]**) and **Softness** for feathered edges
 - **Mouse wheel** zooms at the cursor; **right-drag** (or Space+drag) pans; **Fit** and **100%** buttons
 - **Show removed in red** highlights everything that's been cut away, so holes and leftovers are easy to spot
 - **Ctrl+Z / Ctrl+Y** undo and redo; **Reset to AI result** throws the touch-ups away
 - **Save** (Ctrl+S) rebuilds the finished image with the same size, centering and edge cleanup
 
-Touched-up photos are marked "touched up". When you process a folder again, the app asks whether to keep the touch-ups (fast — no AI needed) or redo everything with the AI. Touch-up data lives in a hidden `.photoprep` folder inside your photos folder.
+Touched-up photos are marked "touched up". When you process a folder again, the app asks whether to keep the touch-ups (fast — no AI needed) or redo everything with the AI. Touch-up data (edited cut-outs and healed pixels) lives in a hidden `.photoprep` folder inside your photos folder.
 
 ### Settings profiles
 

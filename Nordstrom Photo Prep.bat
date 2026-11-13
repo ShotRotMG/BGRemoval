@@ -184,6 +184,7 @@ def process_one(path, folder, s, session, keep_edits=True):
         mask = Image.open(mp).convert("L")
         if mask.size == img.size:
             note = "touched up"
+            img = apply_retouch(img, folder, path)
         else:
             mask = None
     if mask is None:
@@ -195,12 +196,94 @@ def process_one(path, folder, s, session, keep_edits=True):
             mask = mask_from_white(img)
         ensure_edit_dir(folder)
         mask.save(mp, compress_level=1)
-        if flag.exists():
-            flag.unlink()
+        for old in (flag, retouch_path(folder, path)):
+            if old.exists():
+                old.unlink()
     canvas, scale = compose(img, mask, W, H, margin)
     if canvas is None:
         return "No product found", "", None
     return save_output(canvas, scale, path, folder, s, note)
+
+
+# ------------------------------------------------------------- AI heal (LaMa)
+HEAL_DIR = Path.home() / ".nordstrom-photo-prep"
+HEAL_FILE = HEAL_DIR / "lama_fp32.onnx"
+HEAL_SHA256 = "1faef5301d78db7dda502fe59966957ec4b79dd64e16f03ed96913c7a4eb68d6"
+HEAL_URLS = ["https://huggingface.co/Carve/LaMa-ONNX/resolve/main/lama_fp32.onnx",
+             "https://github.com/neureps/carousel-fit-models/releases/download/lama-v1/lama-fp32-1faef5301d78.onnx"]
+_heal_session = None
+
+
+def ensure_heal_model(progress=None):
+    """Download the LaMa fill model once (~208 MB) and check it."""
+    import hashlib, urllib.request
+    if HEAL_FILE.exists():
+        return HEAL_FILE
+    HEAL_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = HEAL_FILE.with_suffix(".part")
+    last = None
+    for url in HEAL_URLS:
+        try:
+            h = hashlib.sha256()
+            with urllib.request.urlopen(url, timeout=60) as r, open(tmp, "wb") as f:
+                total, got = int(r.headers.get("Content-Length") or 0), 0
+                while True:
+                    chunk = r.read(1 << 20)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    h.update(chunk)
+                    got += len(chunk)
+                    if progress and total:
+                        progress(f"Downloading heal model… {got * 100 // total}%")
+            if h.hexdigest() != HEAL_SHA256:
+                raise IOError("download was corrupted")
+            tmp.replace(HEAL_FILE)
+            return HEAL_FILE
+        except Exception as e:
+            last = e
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+    raise IOError(f"Couldn't download the heal model: {last}")
+
+
+def heal_patch(img, hole):
+    """Fill the hole (L, 255 = remove) in img (RGB) with AI. Returns (box, new_patch)."""
+    import numpy as np
+    import onnxruntime as ort
+    from PIL import ImageFilter
+    global _heal_session
+    if _heal_session is None:
+        _heal_session = ort.InferenceSession(str(HEAL_FILE), providers=["CPUExecutionProvider"])
+    l, t, r, b = hole.getbbox()
+    ctx = max(int(max(r - l, b - t) * 2.5), 256)       # surrounding context for the AI
+    cx, cy = (l + r) // 2, (t + b) // 2
+    box = (max(cx - ctx // 2, 0), max(cy - ctx // 2, 0), min(cx + ctx // 2, img.width), min(cy + ctx // 2, img.height))
+    crop = img.crop(box)
+    hcrop = hole.crop(box).filter(ImageFilter.MaxFilter(5))
+    x = np.asarray(crop.resize((512, 512), Image.LANCZOS)).astype(np.float32).transpose(2, 0, 1)[None] / 255
+    m = (np.asarray(hcrop.resize((512, 512), Image.BILINEAR)) > 20).astype(np.float32)[None, None]
+    out = _heal_session.run(None, {"image": x, "mask": m})[0][0].transpose(1, 2, 0)
+    if out.max() <= 1.5:
+        out = out * 255
+    filled = Image.fromarray(np.clip(out, 0, 255).astype(np.uint8)).resize(crop.size, Image.LANCZOS)
+    return box, Image.composite(filled, crop, hcrop.filter(ImageFilter.GaussianBlur(2)))
+
+
+def retouch_path(folder, path):
+    return Path(folder) / EDIT_DIR / f"{Path(path).stem}.retouch.png"
+
+
+def apply_retouch(img, folder, path):
+    rp = retouch_path(folder, path)
+    if rp.exists():
+        layer = Image.open(rp).convert("RGBA")
+        if layer.size == img.size:
+            img = img.copy()
+            img.paste(layer.convert("RGB"), (0, 0), layer.getchannel("A"))
+    return img
 
 
 # ------------------------------------------------------------ touch-up editor
@@ -218,7 +301,8 @@ class TouchUpWindow(tk.Toplevel):
         self.geometry(f"{min(1200, sw - 60)}x{min(980, sh - 70)}")
         self.minsize(700, 560)
 
-        self.img_full = load_source(self.src)
+        self.orig_full = load_source(self.src)
+        self.img_full = apply_retouch(self.orig_full, self.folder, self.src)
         self.mask_full = Image.open(mask_path(self.folder, self.src)).convert("L")
         bb = self.mask_full.point(lambda a: 255 if a > 40 else 0).getbbox() or (0, 0, *self.img_full.size)
         pw, ph = int((bb[2] - bb[0]) * 0.12) + 40, int((bb[3] - bb[1]) * 0.12) + 40
@@ -226,6 +310,8 @@ class TouchUpWindow(tk.Toplevel):
         self.box = (max(bb[0] - pw, 0), max(bb[1] - ph, 0), min(bb[2] + pw, W), min(bb[3] + ph, H))
         self.img = self.img_full.crop(self.box)          # work area around the product
         self.mask = self.mask_full.crop(self.box)
+        self.orig = self.orig_full.crop(self.box)
+        self._busy = False
         self.undo, self.redo, self.dirty = [], [], False
         self.z, self.vx, self.vy = 1.0, 0.0, 0.0           # zoom and top-left of view (work-area px)
         self._photo, self._job, self._stroke = None, None, None
@@ -236,7 +322,8 @@ class TouchUpWindow(tk.Toplevel):
         tb.pack(fill="x")
         self.v_mode = tk.StringVar(value="erase")
         ttk.Radiobutton(tb, text="Erase (E)", value="erase", variable=self.v_mode, command=self.draw_cursor).pack(side="left")
-        ttk.Radiobutton(tb, text="Restore (R)", value="restore", variable=self.v_mode, command=self.draw_cursor).pack(side="left", padx=(8, 16))
+        ttk.Radiobutton(tb, text="Restore (R)", value="restore", variable=self.v_mode, command=self.draw_cursor).pack(side="left", padx=8)
+        ttk.Radiobutton(tb, text="Heal (H)", value="heal", variable=self.v_mode, command=self.draw_cursor).pack(side="left", padx=(0, 16))
         ttk.Label(tb, text="Brush").pack(side="left")
         self.v_size = tk.DoubleVar(value=40)
         ttk.Scale(tb, from_=2, to=400, variable=self.v_size, length=150,
@@ -263,7 +350,7 @@ class TouchUpWindow(tk.Toplevel):
         self.lbl_info.pack(side="right", padx=12)
         ttk.Label(self, foreground="#888", padding=(10, 0),
                   text="Left-drag paints  ·  Right-drag or Space+drag pans  ·  Wheel zooms  ·  [ ] brush size  ·  "
-                       "E/R switch  ·  Ctrl+Z / Ctrl+Y").pack(side="bottom", anchor="w")
+                       "E/R/H switch  ·  Ctrl+Z / Ctrl+Y").pack(side="bottom", anchor="w")
 
         self.canvas = tk.Canvas(self, bg="#9a9a9a", highlightthickness=0, cursor="none")
         self.canvas.pack(fill="both", expand=True, padx=10)
@@ -285,6 +372,7 @@ class TouchUpWindow(tk.Toplevel):
         self.bind("<KeyRelease-space>", lambda e: setattr(self, "_space", False))
         self.bind("<Key-e>", lambda e: (self.v_mode.set("erase"), self.draw_cursor()))
         self.bind("<Key-r>", lambda e: (self.v_mode.set("restore"), self.draw_cursor()))
+        self.bind("<Key-h>", lambda e: (self.v_mode.set("heal"), self.draw_cursor()))
         self.bind("<Key-bracketleft>", lambda e: self.set_size(self.v_size.get() / 1.25))
         self.bind("<Key-bracketright>", lambda e: self.set_size(self.v_size.get() * 1.25))
         self.bind("<Control-z>", lambda e: self.do_undo())
@@ -363,7 +451,7 @@ class TouchUpWindow(tk.Toplevel):
         x, y = self._mouse
         r = self.v_size.get() * self.z / 2
         c.delete("cursor")
-        color = "#d32f2f" if self.v_mode.get() == "erase" else "#1e88e5"
+        color = {"erase": "#d32f2f", "restore": "#1e88e5", "heal": "#2e7d32"}[self.v_mode.get()]
         c.create_oval(x - r, y - r, x + r, y + r, outline=color, width=2, tags="cursor")
         c.create_oval(x - r - 1, y - r - 1, x + r + 1, y + r + 1, outline="white", width=1, tags="cursor")
 
@@ -383,6 +471,14 @@ class TouchUpWindow(tk.Toplevel):
     def stroke_start(self, e):
         if self._space:
             return self.pan_start(e)
+        if self._busy:
+            return
+        if self.v_mode.get() == "heal":
+            self._stroke = [self.to_img(e)]
+            w = self.v_size.get() * self.z
+            self.canvas.create_oval(e.x - w / 2, e.y - w / 2, e.x + w / 2, e.y + w / 2,
+                                    fill="#66bb6a", outline="", tags="healstroke")
+            return
         self._before = self.mask.copy()
         self._stroke = [self.to_img(e)]
         self.paint_segment(self._stroke[0], self._stroke[0])
@@ -394,6 +490,14 @@ class TouchUpWindow(tk.Toplevel):
         if self._stroke is None:
             return
         p = self.to_img(e)
+        if self.v_mode.get() == "heal":
+            a = self._stroke[-1]
+            self.canvas.create_line((a[0] - self.vx) * self.z, (a[1] - self.vy) * self.z, e.x, e.y,
+                                    fill="#66bb6a", width=self.v_size.get() * self.z, capstyle="round",
+                                    tags="healstroke")
+            self._stroke.append(p)
+            self.canvas.tag_raise("cursor")
+            return
         self.paint_segment(self._stroke[-1], p)
         self._stroke.append(p)
         self.schedule(25)
@@ -413,6 +517,9 @@ class TouchUpWindow(tk.Toplevel):
             return
         if self._stroke is None:
             return
+        if self.v_mode.get() == "heal":
+            pts, self._stroke = self._stroke, None
+            return self.start_heal(pts)
         from PIL import ImageChops, ImageDraw, ImageFilter
         w, soft = max(1, round(self.v_size.get())), self.v_soft.get()
         xs = [p[0] for p in self._stroke]
@@ -435,7 +542,7 @@ class TouchUpWindow(tk.Toplevel):
                 else:
                     new = ImageChops.lighter(before, layer)
                 self.mask.paste(new, bb[:2])
-            self.undo.append((bb, before))
+            self.undo.append(("mask", bb, before))
             self.redo.clear()
             if len(self.undo) > 60:
                 self.undo.pop(0)
@@ -444,23 +551,91 @@ class TouchUpWindow(tk.Toplevel):
         self.update_info()
         self.render()
 
+    def _layer(self, kind):
+        return self.mask if kind == "mask" else self.img
+
     def do_undo(self):
-        if self.undo:
-            bb, patch = self.undo.pop()
-            self.redo.append((bb, self.mask.crop(bb)))
-            self.mask.paste(patch, bb[:2])
+        if self.undo and not self._busy:
+            kind, bb, patch = self.undo.pop()
+            self.redo.append((kind, bb, self._layer(kind).crop(bb)))
+            self._layer(kind).paste(patch, bb[:2])
             self.dirty = True
             self.update_info()
             self.render()
 
     def do_redo(self):
-        if self.redo:
-            bb, patch = self.redo.pop()
-            self.undo.append((bb, self.mask.crop(bb)))
-            self.mask.paste(patch, bb[:2])
+        if self.redo and not self._busy:
+            kind, bb, patch = self.redo.pop()
+            self.undo.append((kind, bb, self._layer(kind).crop(bb)))
+            self._layer(kind).paste(patch, bb[:2])
             self.dirty = True
             self.update_info()
             self.render()
+
+    def start_heal(self, pts):
+        """Fill the painted area with AI, in chunks so long strokes keep full detail."""
+        from PIL import ImageDraw
+        w = max(2, round(self.v_size.get()))
+        chunks, cur = [], [pts[0]]
+        for p in pts[1:]:
+            xs = [q[0] for q in cur + [p]]
+            ys = [q[1] for q in cur + [p]]
+            if max(max(xs) - min(xs), max(ys) - min(ys)) + w > 320 and len(cur) > 1:
+                chunks.append(cur)
+                cur = [cur[-1]]
+            cur.append(p)
+        chunks.append(cur)
+        holes = []
+        for ch in chunks:
+            hole = Image.new("L", self.img.size, 0)
+            d = ImageDraw.Draw(hole)
+            d.line(ch if len(ch) > 1 else ch * 2, fill=255, width=w)
+            for x, y in ch:
+                d.ellipse([x - w / 2, y - w / 2, x + w / 2, y + w / 2], fill=255)
+            if hole.getbbox():
+                holes.append(hole)
+        if not holes:
+            self.canvas.delete("healstroke")
+            return
+        self._busy = True
+        self.config(cursor="watch")
+        self.lbl_info.config(text="Healing…")
+        work = self.img.copy()
+
+        def job():
+            try:
+                ensure_heal_model(lambda msg: self.after(0, lambda: self.lbl_info.config(text=msg)))
+                patches = []
+                for i, hole in enumerate(holes, 1):
+                    self.after(0, lambda i=i: self.lbl_info.config(text=f"Healing… {i}/{len(holes)}"))
+                    box, patch = heal_patch(work, hole)
+                    patches.append((box, work.crop(box), patch))
+                    work.paste(patch, box[:2])
+                self.after(0, lambda: self.heal_done(patches, None))
+            except Exception as e:
+                self.after(0, lambda e=e: self.heal_done([], e))
+
+        threading.Thread(target=job, daemon=True).start()
+
+    def heal_done(self, patches, err):
+        self._busy = False
+        try:
+            self.config(cursor="")
+        except tk.TclError:
+            return
+        self.canvas.delete("healstroke")
+        if err:
+            messagebox.showerror("Heal", f"Heal didn't work:\n{err}", parent=self)
+        if patches:   # one undo step for the whole stroke
+            ub = (min(p[0][0] for p in patches), min(p[0][1] for p in patches),
+                  max(p[0][2] for p in patches), max(p[0][3] for p in patches))
+            self.undo.append(("img", ub, self.img.crop(ub)))
+            for box, before, patch in patches:
+                self.img.paste(patch, box[:2])
+            self.redo.clear()
+            self.dirty = True
+        self.update_info()
+        self.render()
 
     def reset_ai(self):
         if not messagebox.askyesno("Touch up", "Throw away all touch-ups on this photo and go back to the "
@@ -471,14 +646,16 @@ class TouchUpWindow(tk.Toplevel):
 
     # ---- save / close
     def save(self):
+        if self._busy:
+            return
         s = dict(self.app.s["current"])
         self.config(cursor="watch")
         self.update_idletasks()
         try:
             if getattr(self, "_reset", False):
-                flag = edited_flag(self.folder, self.src)
-                if flag.exists():
-                    flag.unlink()
+                for old in (edited_flag(self.folder, self.src), retouch_path(self.folder, self.src)):
+                    if old.exists():
+                        old.unlink()
                 session = self.app.get_session(s.get("quality", "best")) if s["remove_bg"] else None
                 status, detail, dest = process_one(self.src, self.folder, s, session, keep_edits=False)
             else:
@@ -487,7 +664,21 @@ class TouchUpWindow(tk.Toplevel):
                 ensure_edit_dir(self.folder)
                 full.save(mask_path(self.folder, self.src), compress_level=1)
                 edited_flag(self.folder, self.src).write_text("touched up by hand\n")
-                canvas, scale = compose(self.img_full, full, s["width"], s["height"], s["margin"] / 100)
+                import numpy as np
+                changed = (np.abs(np.asarray(self.img).astype(int) - np.asarray(self.orig).astype(int)).max(axis=2) > 0)
+                rp = retouch_path(self.folder, self.src)
+                img_used = self.orig_full.copy()
+                if changed.any():
+                    layer = Image.new("RGBA", self.orig_full.size, (0, 0, 0, 0))
+                    arr = np.zeros((*changed.shape, 4), np.uint8)       # only healed pixels, rest empty
+                    arr[changed, :3] = np.asarray(self.img)[changed]
+                    arr[changed, 3] = 255
+                    layer.paste(Image.fromarray(arr, "RGBA"), self.box[:2])
+                    layer.save(rp, compress_level=6)
+                    img_used.paste(self.img, self.box[:2])
+                elif rp.exists():
+                    rp.unlink()
+                canvas, scale = compose(img_used, full, s["width"], s["height"], s["margin"] / 100)
                 if canvas is None:
                     messagebox.showerror("Touch up", "Nothing left to save - the whole shoe is erased.", parent=self)
                     return
