@@ -19,6 +19,7 @@ MARGIN = 0.06          # white space on each side (0.06 = 6%); lower = bigger pr
 OUT_NAME = "White Background"
 SMALL_NAME = "Too small - reshoot"
 MAX_MB = 20
+FINE_EDGES = True      # better edges on fur, hair and soft shadows (a few seconds slower per photo)
 
 import io, re, subprocess, sys
 from pathlib import Path
@@ -45,6 +46,41 @@ from PIL import Image, ImageCms, ImageOps
 from rembg import new_session, remove
 
 pillow_heif.register_heif_opener()  # lets it read iPhone .HEIC photos
+import numpy as np
+
+MATTE_MAX_PX = 3_000_000   # edge refinement resolution cap (keeps memory around 2-3 GB)
+
+
+def fine_cutout(img, session, W, H, margin):
+    """img: full-res RGB. Returns (RGBA cutout at final scale, scale) or (None, None)."""
+    mask = remove(img, session=session, only_mask=True, post_process_mask=True)
+    bbox = mask.point(lambda a: 255 if a > 40 else 0).getbbox()
+    if not bbox:
+        return None, None
+    l, t, r, b = bbox
+    scale = min(W * (1 - 2 * margin) / (r - l), H * (1 - 2 * margin) / (b - t))
+    pad = int(0.04 * max(r - l, b - t))
+    box = (max(l - pad, 0), max(t - pad, 0), min(r + pad, img.width), min(b + pad, img.height))
+    crop = img.crop(box)
+    crop = crop.resize((round(crop.width * scale), round(crop.height * scale)), Image.LANCZOS)
+
+    # refine edges (fur, hair, shadows) at a capped resolution
+    k = min(1.0, (MATTE_MAX_PX / (crop.width * crop.height)) ** 0.5)
+    small = crop if k == 1 else crop.resize((round(crop.width * k), round(crop.height * k)), Image.LANCZOS)
+    cut = remove(small, session=session, alpha_matting=True,
+                 alpha_matting_foreground_threshold=240, alpha_matting_background_threshold=20,
+                 alpha_matting_erode_size=max(5, round(15 * k)))
+    if k != 1:
+        cut = cut.resize(crop.size, Image.BICUBIC)
+    a = np.asarray(cut).astype(np.float32)
+    lum = a[..., :3] @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
+    alpha = a[..., 3]
+    alpha[(alpha < 150) & (lum > 165)] = 0      # faint shadow haze -> clean white
+    alpha[alpha < 8] = 0
+    out = crop.convert("RGBA")
+    out.putalpha(Image.fromarray(np.clip(alpha, 0, 255).astype(np.uint8), "L"))
+    return out, scale
+
 EXTS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif", ".bmp", ".tif", ".tiff"}
 NAME_OK = re.compile(r"^[^_]+_[^_]+_[^_]+$")   # Brand Name_VPN_Color
 SRGB = ImageCms.createProfile("sRGB")
@@ -82,19 +118,24 @@ for i, f in enumerate(files, 1):
     try:
         img = ImageOps.exif_transpose(Image.open(f))
         img = to_srgb(img.convert("RGB")).convert("RGBA")
-        cut = remove(img, session=session, post_process_mask=True)
-        bbox = cut.getchannel("A").point(lambda a: 255 if a > 10 else 0).getbbox()
+        pre = 1.0
+        if FINE_EDGES:
+            cut, pre = fine_cutout(img.convert("RGB"), session, W, H, MARGIN)
+        else:
+            cut = remove(img, session=session, post_process_mask=True)
+        bbox = cut.getchannel("A").point(lambda a: 255 if a > 10 else 0).getbbox() if cut else None
         if not bbox:
             print("no product found, skipped")
             continue
         cut = cut.crop(bbox)
-        scale = min(W * (1 - 2 * MARGIN) / cut.width, H * (1 - 2 * MARGIN) / cut.height)
+        fit = min(W * (1 - 2 * MARGIN) / cut.width, H * (1 - 2 * MARGIN) / cut.height)
+        scale = pre * fit
         dest_dir = out
         if scale > 1.02:   # would need enlarging -> Nordstrom rejects upscaled images
             small.mkdir(exist_ok=True)
             dest_dir = small
             too_small.append(f"{f.name} (needs {scale:.1f}x enlargement)")
-        cut = cut.resize((round(cut.width * scale), round(cut.height * scale)), Image.LANCZOS)
+        cut = cut.resize((min(W, round(cut.width * fit)), min(H, round(cut.height * fit))), Image.LANCZOS)
         canvas = Image.new("RGB", (W, H), (255, 255, 255))
         canvas.paste(cut, ((W - cut.width) // 2, (H - cut.height) // 2), cut)
         dest = dest_dir / f"{f.stem}.jpg"

@@ -26,6 +26,8 @@ Just double-click either file.
 4. Centers it on a pure white (RGB 255) 2640 × 4048 canvas
 5. Saves a max-quality JPG under 20 MB into a `White Background` subfolder
 
+**Fine edges** (on by default) runs a second, edge-refining pass at the final output size. It keeps fur and hair natural instead of chopped or blurry, and removes leftover soft shadows next to the product so the background stays pure white. It adds a few seconds per photo and uses about 3–4 GB of memory. Turn it off in the app's settings (or set `FINE_EDGES = False` near the top of `White Background.bat`) for faster runs on simple products.
+
 Originals are never changed. Supported: JPG, PNG, HEIC, WEBP, TIFF, BMP.
 
 ### Reviewing results
