@@ -19,7 +19,7 @@ MARGIN = 0.06          # white space on each side (0.06 = 6%); lower = bigger pr
 OUT_NAME = "White Background"
 SMALL_NAME = "Too small - reshoot"
 MAX_MB = 20
-FINE_EDGES = True      # better edges on fur, hair and soft shadows (a few seconds slower per photo)
+QUALITY = "best"       # "best" = cleanest edges (BiRefNet, ~1 GB download, slower); "fast" = quicker, rougher edges
 
 import io, re, subprocess, sys
 from pathlib import Path
@@ -48,38 +48,54 @@ from rembg import new_session, remove
 pillow_heif.register_heif_opener()  # lets it read iPhone .HEIC photos
 import numpy as np
 
-MATTE_MAX_PX = 3_000_000   # edge refinement resolution cap (keeps memory around 2-3 GB)
+MODELS = {"best": "birefnet-general", "fast": "isnet-general-use"}
 
 
-def fine_cutout(img, session, W, H, margin):
-    """img: full-res RGB. Returns (RGBA cutout at final scale, scale) or (None, None)."""
-    mask = remove(img, session=session, only_mask=True, post_process_mask=True)
-    bbox = mask.point(lambda a: 255 if a > 40 else 0).getbbox()
-    if not bbox:
+def make_session(quality):
+    """AI model session. 'best' = BiRefNet (fine detail, ~1 GB download, needs ~6 GB RAM)."""
+    import onnxruntime as ort
+    from rembg import new_session
+    so = ort.SessionOptions()
+    so.enable_cpu_mem_arena = False   # lower peak memory
+    return new_session(MODELS[quality], sess_opts=so)
+
+
+def mask_from_white(img, tol=12):
+    from PIL import ImageChops
+    diff = ImageChops.difference(img, Image.new("RGB", img.size, "white")).convert("L")
+    return diff.point(lambda v: 255 if v > tol else 0)
+
+
+def compose(img, mask, W, H, margin):
+    """Cut the product out with its soft mask and center it on a pure white W x H canvas.
+    Returns (canvas, scale) where scale > 1 means the product had to be enlarged."""
+    import numpy as np
+    from PIL import ImageFilter
+    from pymatting import estimate_foreground_ml
+    m = mask.point(lambda a: 0 if a < 12 else a)                     # drop faint noise
+    bb = m.point(lambda a: 255 if a > 40 else 0).getbbox()
+    if not bb:
         return None, None
-    l, t, r, b = bbox
+    l, t, r, b = bb
     scale = min(W * (1 - 2 * margin) / (r - l), H * (1 - 2 * margin) / (b - t))
-    pad = int(0.04 * max(r - l, b - t))
+    pad = 8
     box = (max(l - pad, 0), max(t - pad, 0), min(r + pad, img.width), min(b + pad, img.height))
-    crop = img.crop(box)
-    crop = crop.resize((round(crop.width * scale), round(crop.height * scale)), Image.LANCZOS)
+    size = (max(1, round((box[2] - box[0]) * scale)), max(1, round((box[3] - box[1]) * scale)))
+    ci = img.crop(box).resize(size, Image.LANCZOS)
+    cm = m.crop(box).resize(size, Image.LANCZOS)
+    cm = cm.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.GaussianBlur(0.6))   # tighten edge 1 px
+    rgb = np.asarray(ci).astype(np.float64) / 255
+    a = np.asarray(cm).astype(np.float64) / 255
+    rgb = np.clip(estimate_foreground_ml(rgb, a), 0, 1)              # remove background color from edges
+    out = rgb * a[..., None] + (1 - a[..., None])                    # onto pure white
+    tile = Image.fromarray((out * 255 + 0.5).astype(np.uint8))
+    canvas = Image.new("RGB", (W, H), (255, 255, 255))
+    x = (W - round((r - l) * scale)) // 2 - round((l - box[0]) * scale)
+    y = (H - round((b - t) * scale)) // 2 - round((t - box[1]) * scale)
+    canvas.paste(tile, (x, y))
+    return canvas, scale
 
-    # refine edges (fur, hair, shadows) at a capped resolution
-    k = min(1.0, (MATTE_MAX_PX / (crop.width * crop.height)) ** 0.5)
-    small = crop if k == 1 else crop.resize((round(crop.width * k), round(crop.height * k)), Image.LANCZOS)
-    cut = remove(small, session=session, alpha_matting=True,
-                 alpha_matting_foreground_threshold=240, alpha_matting_background_threshold=20,
-                 alpha_matting_erode_size=max(5, round(15 * k)))
-    if k != 1:
-        cut = cut.resize(crop.size, Image.BICUBIC)
-    a = np.asarray(cut).astype(np.float32)
-    lum = a[..., :3] @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
-    alpha = a[..., 3]
-    alpha[(alpha < 150) & (lum > 165)] = 0      # faint shadow haze -> clean white
-    alpha[alpha < 8] = 0
-    out = crop.convert("RGBA")
-    out.putalpha(Image.fromarray(np.clip(alpha, 0, 255).astype(np.uint8), "L"))
-    return out, scale
+
 
 EXTS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif", ".bmp", ".tif", ".tiff"}
 NAME_OK = re.compile(r"^[^_]+_[^_]+_[^_]+$")   # Brand Name_VPN_Color
@@ -109,35 +125,26 @@ if not files:
 out.mkdir(exist_ok=True)
 
 print(f"Processing {len(files)} photo(s) in {src}")
-print("Loading background-removal model (first run downloads ~180 MB)...")
-session = new_session("isnet-general-use")
+print("Loading background-removal model...")
+print("(Best quality downloads ~1 GB the first time.)" if QUALITY == "best" else "")
+session = make_session(QUALITY)
 
 ok, too_small, bad_names = 0, [], []
 for i, f in enumerate(files, 1):
     print(f"[{i}/{len(files)}] {f.name}", end=" ... ", flush=True)
     try:
         img = ImageOps.exif_transpose(Image.open(f))
-        img = to_srgb(img.convert("RGB")).convert("RGBA")
-        pre = 1.0
-        if FINE_EDGES:
-            cut, pre = fine_cutout(img.convert("RGB"), session, W, H, MARGIN)
-        else:
-            cut = remove(img, session=session, post_process_mask=True)
-        bbox = cut.getchannel("A").point(lambda a: 255 if a > 10 else 0).getbbox() if cut else None
-        if not bbox:
+        img = to_srgb(img.convert("RGB")).convert("RGB")
+        mask = remove(img, session=session, only_mask=True, post_process_mask=(QUALITY == "fast"))
+        canvas, scale = compose(img, mask, W, H, MARGIN)
+        if canvas is None:
             print("no product found, skipped")
             continue
-        cut = cut.crop(bbox)
-        fit = min(W * (1 - 2 * MARGIN) / cut.width, H * (1 - 2 * MARGIN) / cut.height)
-        scale = pre * fit
         dest_dir = out
         if scale > 1.02:   # would need enlarging -> Nordstrom rejects upscaled images
             small.mkdir(exist_ok=True)
             dest_dir = small
             too_small.append(f"{f.name} (needs {scale:.1f}x enlargement)")
-        cut = cut.resize((min(W, round(cut.width * fit)), min(H, round(cut.height * fit))), Image.LANCZOS)
-        canvas = Image.new("RGB", (W, H), (255, 255, 255))
-        canvas.paste(cut, ((W - cut.width) // 2, (H - cut.height) // 2), cut)
         dest = dest_dir / f"{f.stem}.jpg"
         for q in (100, 95, 92):
             canvas.save(dest, quality=q, subsampling=0, dpi=(300, 300), icc_profile=SRGB_BYTES)

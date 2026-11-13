@@ -50,7 +50,7 @@ SRGB_BYTES = ImageCms.ImageCmsProfile(SRGB).tobytes()
 SETTINGS_FILE = Path(os.environ.get("APPDATA", Path.home())) / "NordstromPhotoPrep" / "settings.json"
 BUILTIN = "Nordstrom (default)"
 BUILTIN_VALS = {"width": 2640, "height": 4048, "margin": 6.0, "fmt": "jpg", "remove_bg": True,
-                "allow_up": False, "max_up": 1.25, "out_name": OUT_NAME, "fine_edges": True}
+                "allow_up": False, "max_up": 1.25, "out_name": OUT_NAME, "quality": "best"}
 PROFILE_KEYS = list(BUILTIN_VALS)
 
 # ----------------------------------------------------------------- processing
@@ -67,74 +67,68 @@ def to_srgb(img):
         return img
 
 
-def cutout_from_white(img, tol=12):
+MODELS = {"best": "birefnet-general", "fast": "isnet-general-use"}
+
+
+def make_session(quality):
+    """AI model session. 'best' = BiRefNet (fine detail, ~1 GB download, needs ~6 GB RAM)."""
+    import onnxruntime as ort
+    from rembg import new_session
+    so = ort.SessionOptions()
+    so.enable_cpu_mem_arena = False   # lower peak memory
+    return new_session(MODELS[quality], sess_opts=so)
+
+
+def mask_from_white(img, tol=12):
     from PIL import ImageChops
-    diff = ImageChops.difference(img.convert("RGB"), Image.new("RGB", img.size, "white")).convert("L")
-    out = img.convert("RGBA")
-    out.putalpha(diff.point(lambda v: 255 if v > tol else 0))
-    return out
+    diff = ImageChops.difference(img, Image.new("RGB", img.size, "white")).convert("L")
+    return diff.point(lambda v: 255 if v > tol else 0)
 
 
-# Fine edges: find the product, bring it to final size, then refine the edges
-# (fur, hair, soft shadows) with alpha matting and clean up leftover shadow haze.
-
-MATTE_MAX_PX = 3_000_000   # edge refinement resolution cap (keeps memory around 2-3 GB)
-
-
-def fine_cutout(img, session, W, H, margin):
+def compose(img, mask, W, H, margin):
+    """Cut the product out with its soft mask and center it on a pure white W x H canvas.
+    Returns (canvas, scale) where scale > 1 means the product had to be enlarged."""
     import numpy as np
-    from rembg import remove
-    """img: full-res RGB. Returns (RGBA cutout at final scale, scale) or (None, None)."""
-    mask = remove(img, session=session, only_mask=True, post_process_mask=True)
-    bbox = mask.point(lambda a: 255 if a > 40 else 0).getbbox()
-    if not bbox:
+    from PIL import ImageFilter
+    from pymatting import estimate_foreground_ml
+    m = mask.point(lambda a: 0 if a < 12 else a)                     # drop faint noise
+    bb = m.point(lambda a: 255 if a > 40 else 0).getbbox()
+    if not bb:
         return None, None
-    l, t, r, b = bbox
+    l, t, r, b = bb
     scale = min(W * (1 - 2 * margin) / (r - l), H * (1 - 2 * margin) / (b - t))
-    pad = int(0.04 * max(r - l, b - t))
+    pad = 8
     box = (max(l - pad, 0), max(t - pad, 0), min(r + pad, img.width), min(b + pad, img.height))
-    crop = img.crop(box)
-    crop = crop.resize((round(crop.width * scale), round(crop.height * scale)), Image.LANCZOS)
-
-    # refine edges (fur, hair, shadows) at a capped resolution
-    k = min(1.0, (MATTE_MAX_PX / (crop.width * crop.height)) ** 0.5)
-    small = crop if k == 1 else crop.resize((round(crop.width * k), round(crop.height * k)), Image.LANCZOS)
-    cut = remove(small, session=session, alpha_matting=True,
-                 alpha_matting_foreground_threshold=240, alpha_matting_background_threshold=20,
-                 alpha_matting_erode_size=max(5, round(15 * k)))
-    if k != 1:
-        cut = cut.resize(crop.size, Image.BICUBIC)
-    a = np.asarray(cut).astype(np.float32)
-    lum = a[..., :3] @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
-    alpha = a[..., 3]
-    alpha[(alpha < 150) & (lum > 165)] = 0      # faint shadow haze -> clean white
-    alpha[alpha < 8] = 0
-    out = crop.convert("RGBA")
-    out.putalpha(Image.fromarray(np.clip(alpha, 0, 255).astype(np.uint8), "L"))
-    return out, scale
+    size = (max(1, round((box[2] - box[0]) * scale)), max(1, round((box[3] - box[1]) * scale)))
+    ci = img.crop(box).resize(size, Image.LANCZOS)
+    cm = m.crop(box).resize(size, Image.LANCZOS)
+    cm = cm.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.GaussianBlur(0.6))   # tighten edge 1 px
+    rgb = np.asarray(ci).astype(np.float64) / 255
+    a = np.asarray(cm).astype(np.float64) / 255
+    rgb = np.clip(estimate_foreground_ml(rgb, a), 0, 1)              # remove background color from edges
+    out = rgb * a[..., None] + (1 - a[..., None])                    # onto pure white
+    tile = Image.fromarray((out * 255 + 0.5).astype(np.uint8))
+    canvas = Image.new("RGB", (W, H), (255, 255, 255))
+    x = (W - round((r - l) * scale)) // 2 - round((l - box[0]) * scale)
+    y = (H - round((b - t) * scale)) // 2 - round((t - box[1]) * scale)
+    canvas.paste(tile, (x, y))
+    return canvas, scale
 
 
 def process_one(path, folder, s, session):
     """Returns (status, detail, output_path)."""
     W, H, margin = s["width"], s["height"], s["margin"] / 100
     img = ImageOps.exif_transpose(Image.open(path))
-    img = to_srgb(img.convert("RGB"))
-    pre = 1.0
-    if s["remove_bg"] and s.get("fine_edges", True):
-        cut, pre = fine_cutout(img, session, W, H, margin)
-        if cut is None:
-            return "No product found", "", None
-    elif s["remove_bg"]:
+    img = to_srgb(img.convert("RGB")).convert("RGB")
+    if s["remove_bg"]:
         from rembg import remove
-        cut = remove(img.convert("RGBA"), session=session, post_process_mask=True)
+        mask = remove(img, session=session, only_mask=True,
+                      post_process_mask=(s.get("quality") == "fast"))
     else:
-        cut = cutout_from_white(img)
-    bbox = cut.getchannel("A").point(lambda a: 255 if a > 10 else 0).getbbox()
-    if not bbox:
+        mask = mask_from_white(img)
+    canvas, scale = compose(img, mask, W, H, margin)
+    if canvas is None:
         return "No product found", "", None
-    cut = cut.crop(bbox)
-    fit = min(W * (1 - 2 * margin) / cut.width, H * (1 - 2 * margin) / cut.height)
-    scale = pre * fit            # total enlargement vs. the original photo
 
     dest_dir, status, detail = folder / s["out_name"], "Done", ""
     if scale > 1.02:
@@ -143,10 +137,6 @@ def process_one(path, folder, s, session):
         else:
             dest_dir, status, detail = folder / SMALL_NAME, "Too small", f"needs {scale:.2f}x enlargement"
     dest_dir.mkdir(exist_ok=True)
-
-    cut = cut.resize((min(W, round(cut.width * fit)), min(H, round(cut.height * fit))), Image.LANCZOS)
-    canvas = Image.new("RGB", (W, H), (255, 255, 255))
-    canvas.paste(cut, ((W - cut.width) // 2, (H - cut.height) // 2), cut)
 
     if s["fmt"] == "png":
         dest = dest_dir / f"{path.stem}.png"
@@ -320,7 +310,7 @@ class App(tk.Tk):
         self.minsize(980, 680)
         self.s = self.load_settings()
         self.files, self.outputs = [], {}
-        self.q, self.worker, self.cancel, self.session = queue.Queue(), None, threading.Event(), None
+        self.q, self.worker, self.cancel, self.sessions = queue.Queue(), None, threading.Event(), {}
         self._run_items = []
         self._thumbs = {}
         self.build()
@@ -342,11 +332,12 @@ class App(tk.Tk):
             data = {"folder": data.get("folder", ""), "profile": BUILTIN, "profiles": {},
                     "current": {**BUILTIN_VALS, **old}}
         data.setdefault("folder", "")
-        data["profiles"] = {n: {**BUILTIN_VALS, **p} for n, p in data["profiles"].items()}
+        data["profiles"] = {n: {k: {**BUILTIN_VALS, **p}[k] for k in PROFILE_KEYS} for n, p in data["profiles"].items()}
         data["profiles"][BUILTIN] = dict(BUILTIN_VALS)  # built-in always restorable
         if data.get("profile") not in data["profiles"]:
             data["profile"] = BUILTIN
-        data["current"] = {**data["profiles"][data["profile"]], **data.get("current", {})}
+        cur = {**data["profiles"][data["profile"]], **data.get("current", {})}
+        data["current"] = {k: cur[k] for k in PROFILE_KEYS}
         return data
 
     def save_settings(self):
@@ -371,7 +362,7 @@ class App(tk.Tk):
         return {"width": w, "height": h, "margin": round(float(self.v_margin.get()), 1),
                 "fmt": self.v_fmt.get(), "remove_bg": bool(self.v_rbg.get()),
                 "allow_up": bool(self.v_up.get()), "max_up": mu, "out_name": name,
-                "fine_edges": bool(self.v_fine.get())}
+                "quality": self.v_quality.get()}
 
     def read_ui_settings(self, quiet=False):
         vals = self.ui_values(quiet)
@@ -392,7 +383,7 @@ class App(tk.Tk):
         self.v_up.set(vals["allow_up"])
         self.v_maxup.set(str(vals["max_up"]))
         self.v_out.set(vals["out_name"])
-        self.v_fine.set(vals.get("fine_edges", True))
+        self.v_quality.set(vals.get("quality", "best"))
         self._loading = False
         self.update_dirty()
 
@@ -599,9 +590,12 @@ class App(tk.Tk):
                         variable=self.v_rbg).grid(row=r, column=0, columnspan=2, sticky="w", pady=2)
 
         r += 1
-        self.v_fine = tk.BooleanVar(value=cur.get("fine_edges", True))
-        ttk.Checkbutton(st, text="Fine edges: fur, hair, shadows (slower)",
-                        variable=self.v_fine).grid(row=r, column=0, columnspan=2, sticky="w", pady=2)
+        ttk.Label(st, text="Quality:").grid(row=r, column=0, sticky="w")
+        qf = ttk.Frame(st)
+        qf.grid(row=r, column=1, sticky="w", pady=2)
+        self.v_quality = tk.StringVar(value=cur.get("quality", "best"))
+        ttk.Radiobutton(qf, text="Best (cleanest edges, slower)", value="best", variable=self.v_quality).pack(side="left")
+        ttk.Radiobutton(qf, text="Fast", value="fast", variable=self.v_quality).pack(side="left", padx=8)
 
         r += 1
         uf = ttk.Frame(st)
@@ -615,7 +609,7 @@ class App(tk.Tk):
                   foreground="#8a6d00", wraplength=420).grid(row=r + 1, column=0, columnspan=2, sticky="w")
 
         self.refresh_profiles()
-        for v in (self.v_w, self.v_h, self.v_margin, self.v_fmt, self.v_rbg, self.v_up, self.v_maxup, self.v_out, self.v_fine):
+        for v in (self.v_w, self.v_h, self.v_margin, self.v_fmt, self.v_rbg, self.v_up, self.v_maxup, self.v_out, self.v_quality):
             v.trace_add("write", self.update_dirty)
         self.update_dirty()
 
@@ -742,14 +736,20 @@ class App(tk.Tk):
         self.worker = threading.Thread(target=self.run, args=(list(self.files), dict(self.s["current"]), self.folder), daemon=True)
         self.worker.start()
 
+    def get_session(self, quality):
+        if quality not in self.sessions:
+            if quality == "best":
+                self.q.put(("status", "Loading the Best-quality model (first time downloads ~1 GB)…"))
+            else:
+                self.q.put(("status", "Loading the Fast model (first time downloads ~180 MB)…"))
+            self.sessions[quality] = make_session(quality)
+        return self.sessions[quality]
+
     def run(self, files, s, folder):
         try:
-            if s["remove_bg"] and self.session is None:
-                self.q.put(("status", "Loading the AI model (first time downloads ~180 MB)…"))
-                from rembg import new_session
-                self.session = new_session("isnet-general-use")
-            if s["remove_bg"] and s.get("fine_edges", True) and not getattr(self, "_matting_ready", False):
-                self.q.put(("status", "Preparing fine-edge tools (first time can take a minute)…"))
+            session = self.get_session(s.get("quality", "best")) if s["remove_bg"] else None
+            if not getattr(self, "_matting_ready", False):
+                self.q.put(("status", "Preparing edge tools (first time can take a minute)…"))
                 import pymatting  # noqa  (first import compiles; slow once)
                 self._matting_ready = True
             counts = {"ok": 0, "small": 0, "fail": 0}
@@ -760,7 +760,17 @@ class App(tk.Tk):
                 self.q.put(("row", str(p), "Working…", "", "busy", None))
                 self.q.put(("status", f"Processing {i} of {len(files)}: {p.name}"))
                 try:
-                    status, detail, dest = process_one(p, folder, s, self.session)
+                    try:
+                        status, detail, dest = process_one(p, folder, s, session)
+                    except Exception as e:
+                        out_of_memory = isinstance(e, MemoryError) or "alloc" in str(e).lower()
+                        if s.get("quality") != "best" or not out_of_memory:
+                            raise
+                        self.q.put(("warn", "Not enough memory for Best quality - switching this run to Fast."))
+                        s["quality"] = "fast"
+                        self.sessions.pop("best", None)
+                        session = self.get_session("fast")
+                        status, detail, dest = process_one(p, folder, s, session)
                     tag = {"Done": "ok", "Done (enlarged)": "warn", "Too small": "bad"}.get(status, "bad")
                     counts["ok" if status.startswith("Done") else "small" if status == "Too small" else "fail"] += 1
                     self.q.put(("row", str(p), status, detail, tag, dest))
@@ -800,6 +810,8 @@ class App(tk.Tk):
                             self.tree.see(iid)
                         if self.tree.selection() and self.tree.selection()[0] == iid:
                             self.show_preview()
+                elif m[0] == "warn":
+                    messagebox.showwarning(APP, m[1])
                 elif m[0] == "error":
                     messagebox.showerror(APP, m[1][-1500:])
                 elif m[0] == "end":
