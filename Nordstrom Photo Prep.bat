@@ -743,6 +743,8 @@ class ReviewWindow(tk.Toplevel):
         ttk.Button(bar, text="Show in folder", command=self.show_in_folder).pack(side="right", padx=6)
         ttk.Button(bar, text="Open file", command=lambda: App.open_path(self.cur["out"])).pack(side="right")
         ttk.Button(bar, text="✎ Touch up…", command=self.touch_up).pack(side="left", padx=(16, 0))
+        self.btn_reproc = ttk.Button(bar, text="↻ Reprocess", command=self.reprocess)
+        self.btn_reproc.pack(side="left", padx=6)
 
         opts = ttk.Frame(self, padding=(14, 0, 14, 0))
         opts.pack(fill="x", side="bottom")
@@ -752,7 +754,7 @@ class ReviewWindow(tk.Toplevel):
         self.v_problems = tk.BooleanVar(value=False)
         ttk.Checkbutton(opts, text="Only show problems", variable=self.v_problems,
                         command=self.apply_filter).pack(side="right")
-        ttk.Label(self, text="← → to move  ·  Space flips before/after  ·  T touch up  ·  Esc closes",
+        ttk.Label(self, text="← → to move  ·  Space flips before/after  ·  T touch up  ·  P reprocess  ·  Esc closes",
                   foreground="#888", padding=(14, 0)).pack(side="bottom", anchor="w")
 
         self.canvas = tk.Canvas(self, bg="#c8c8c8", highlightthickness=0)
@@ -762,7 +764,7 @@ class ReviewWindow(tk.Toplevel):
         for key, fn in (("<Left>", lambda e: self.go(-1)), ("<Right>", lambda e: self.go(1)),
                         ("<Home>", lambda e: self.jump(0)), ("<End>", lambda e: self.jump(len(self.items) - 1)),
                         ("<space>", lambda e: self.flip()), ("<Escape>", lambda e: self.destroy()),
-                        ("<Key-t>", lambda e: self.touch_up())):
+                        ("<Key-t>", lambda e: self.touch_up()), ("<Key-p>", lambda e: self.reprocess())):
             self.bind(key, fn)
         self.transient(master)
         self.focus_set()
@@ -851,6 +853,21 @@ class ReviewWindow(tk.Toplevel):
             return
         TouchUpWindow(self, app, it["src"], app.folder, on_saved=self.touched)
 
+    def reprocess(self):
+        app, src = self.master, self.cur["src"]
+
+        def done():
+            if not self.winfo_exists():
+                return
+            self.btn_reproc.config(state="normal")
+            if app.tree.exists(src) and src in app.outputs:
+                self.touched(src, app.tree.set(src, "status"), app.tree.set(src, "detail"), app.outputs[src])
+
+        if app.process([Path(src)], on_done=done):
+            self.btn_reproc.config(state="disabled")
+            self.lbl_status.config(text="Reprocessing…", foreground="#1e88e5")
+            self.lbl_detail.config(text="")
+
     def touched(self, src, status, detail, dest):
         self.master.update_result(src, status, detail, dest)
         tag = {"Done": "ok", "Done (enlarged)": "warn"}.get(status, "bad")
@@ -884,7 +901,7 @@ class App(tk.Tk):
         self.s = self.load_settings()
         self.files, self.outputs = [], {}
         self.q, self.worker, self.cancel, self.sessions = queue.Queue(), None, threading.Event(), {}
-        self._run_items = []
+        self._run_items, self._on_done = [], None
         self._thumbs = {}
         self.build()
         if self.s["folder"] and Path(self.s["folder"]).is_dir():
@@ -1056,8 +1073,10 @@ class App(tk.Tk):
         ttk.Label(self, textvariable=self.v_status, padding=(12, 0, 12, 8), foreground="#444").pack(fill="x", side="bottom")
         bottom = ttk.Frame(self, padding=(12, 4, 12, 4))
         bottom.pack(fill="x", side="bottom")
-        self.btn_go = ttk.Button(bottom, text="Process photos", style="Big.TButton", command=self.start)
+        self.btn_go = ttk.Button(bottom, text="Process all", style="Big.TButton", command=self.start)
         self.btn_go.pack(side="right")
+        self.btn_redo = ttk.Button(bottom, text="↻ Reprocess selected", command=self.reprocess_selected)
+        self.btn_redo.pack(side="right", padx=(8, 0))
         self.btn_cancel = ttk.Button(bottom, text="Stop", command=self.cancel.set, state="disabled")
         self.btn_cancel.pack(side="right", padx=8)
         self.prog = ttk.Progressbar(bottom, mode="determinate")
@@ -1069,7 +1088,7 @@ class App(tk.Tk):
         left = ttk.Frame(body)
         body.add(left, weight=3)
         cols = ("size", "status", "detail")
-        self.tree = ttk.Treeview(left, columns=cols, selectmode="browse")
+        self.tree = ttk.Treeview(left, columns=cols, selectmode="extended")
         self.tree.heading("#0", text="Photo")
         self.tree.heading("size", text="Size (px)")
         self.tree.heading("status", text="Status")
@@ -1085,6 +1104,14 @@ class App(tk.Tk):
         self.tree.bind("<<TreeviewSelect>>", lambda e: self.show_preview())
         self._resize_job = None
         self.tree.bind("<Double-1>", lambda e: self.open_selected_output())
+        self.menu = tk.Menu(self, tearoff=0)
+        self.menu.add_command(label="↻ Reprocess", command=self.reprocess_selected)
+        self.menu.add_command(label="↻ Reprocess with AI (discard touch-ups)",
+                              command=lambda: self.tree.selection() and self.process([Path(i) for i in self.tree.selection()], keep=False))
+        self.menu.add_separator()
+        self.menu.add_command(label="Review…", command=self.review)
+        self.menu.add_command(label="Open finished file", command=self.open_selected_output)
+        self.tree.bind("<Button-3>", self.popup)
         for tag, color in (("ok", "#e6f4ea"), ("warn", "#fff4d6"), ("bad", "#fde2e1"), ("busy", "#e3eefc")):
             self.tree.tag_configure(tag, background=color)
 
@@ -1104,7 +1131,7 @@ class App(tk.Tk):
         prev.rowconfigure(0, weight=1)
         st = ttk.LabelFrame(right, text="Settings", padding=10)
         st.pack(fill="x", side="bottom")
-        ttk.Label(right, text="Double-click a photo to open the finished file. Review… steps through results.", foreground="#666").pack(anchor="w", pady=(4, 6), side="bottom")
+        ttk.Label(right, text="Right-click photos to reprocess them. Double-click opens the finished file.", foreground="#666").pack(anchor="w", pady=(4, 6), side="bottom")
         prev.pack(fill="both", expand=True)
         cur = self.s["current"]
         r = 0
@@ -1232,6 +1259,13 @@ class App(tk.Tk):
             d.mkdir(exist_ok=True)
             self.open_path(d)
 
+    def popup(self, e):
+        row = self.tree.identify_row(e.y)
+        if row and row not in self.tree.selection():
+            self.tree.selection_set(row)
+        if self.tree.selection():
+            self.menu.tk_popup(e.x_root, e.y_root)
+
     def update_result(self, iid, status, detail, dest):
         tag = {"Done": "ok", "Done (enlarged)": "warn"}.get(status, "bad")
         if self.tree.exists(iid):
@@ -1305,27 +1339,50 @@ class App(tk.Tk):
 
     # ---- processing
     def start(self):
+        """Process every photo in the folder."""
         if not self.files:
             messagebox.showinfo(APP, "Choose a folder with photos first.")
             return
-        if not self.read_ui_settings():
+        self.process(list(self.files))
+
+    def reprocess_selected(self):
+        sel = [Path(i) for i in self.tree.selection()]
+        if not sel:
+            messagebox.showinfo(APP, "Select one or more photos in the list first "
+                                     "(Ctrl+click or Shift+click to pick several).")
             return
-        edited = [p for p in self.files if edited_flag(self.folder, p).exists()]
-        keep = True
-        if edited:
-            ans = messagebox.askyesnocancel(APP, f"{len(edited)} photo(s) in this folder have hand touch-ups.\n\n"
-                                                 "Yes = keep the touch-ups (just rebuild those photos)\n"
-                                                 "No = throw them away and redo everything with the AI")
-            if ans is None:
-                return
-            keep = ans
+        self.process(sel)
+
+    def busy(self):
+        return self.worker is not None and self.worker.is_alive()
+
+    def process(self, files, keep=None, on_done=None):
+        """Run photos through the pipeline. keep=None asks about touch-ups if any exist."""
+        if self.busy():
+            messagebox.showinfo(APP, "Already processing - wait for it to finish or click Stop.")
+            return False
+        if not self.read_ui_settings():
+            return False
+        if keep is None:
+            edited = [p for p in files if edited_flag(self.folder, p).exists()]
+            keep = True
+            if edited:
+                what = "this photo has" if len(files) == 1 else f"{len(edited)} of these photos have"
+                ans = messagebox.askyesnocancel(APP, f"{what[0].upper() + what[1:]} hand touch-ups.\n\n"
+                                                     "Yes = keep the touch-ups (just rebuild)\n"
+                                                     "No = throw them away and redo with the AI")
+                if ans is None:
+                    return False
+                keep = ans
         self.cancel.clear()
-        self._run_items = []
-        self.btn_go.config(state="disabled")
+        self._run_items, self._on_done = [], on_done
+        for b in (self.btn_go, self.btn_redo):
+            b.config(state="disabled")
         self.btn_cancel.config(state="normal")
-        self.prog.config(maximum=len(self.files), value=0)
-        self.worker = threading.Thread(target=self.run, args=(list(self.files), dict(self.s["current"]), self.folder, keep), daemon=True)
+        self.prog.config(maximum=len(files), value=0)
+        self.worker = threading.Thread(target=self.run, args=(list(files), dict(self.s["current"]), self.folder, keep), daemon=True)
         self.worker.start()
+        return True
 
     def get_session(self, quality):
         if quality not in self.sessions:
@@ -1408,9 +1465,13 @@ class App(tk.Tk):
                 elif m[0] == "error":
                     messagebox.showerror(APP, m[1][-1500:])
                 elif m[0] == "end":
-                    self.btn_go.config(state="normal")
+                    for b in (self.btn_go, self.btn_redo):
+                        b.config(state="normal")
                     self.btn_cancel.config(state="disabled")
-                    if any(i in self.outputs for i in self._run_items):
+                    done, self._on_done = self._on_done, None
+                    if done:
+                        done()
+                    elif any(i in self.outputs for i in self._run_items):
                         self.review(only=self._run_items)
         except queue.Empty:
             pass

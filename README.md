@@ -30,6 +30,15 @@ Just double-click either file.
 
 Originals are never changed. Supported: JPG, PNG, HEIC, WEBP, TIFF, BMP.
 
+### Reprocessing
+
+- **Process all** runs every photo in the folder.
+- **↻ Reprocess selected** runs only the photos you've selected in the list (Ctrl+click or Shift+click to pick several) — handy after changing a setting, or to retry one photo.
+- **Right-click** photos in the list for Reprocess, Reprocess with AI (discarding touch-ups), Review and Open finished file.
+- In the review window, **↻ Reprocess** (or **P**) reruns the photo you're looking at and shows the new result.
+
+If a photo has hand touch-ups, you're asked whether to keep them or redo it with the AI.
+
 ### Reviewing results
 
 When a batch finishes, a review window opens so you can check each finished photo one at a time:
