@@ -1,18 +1,29 @@
-# Build and Release Folders
-bin-debug/
-bin-release/
-[Oo]bj/
-[Bb]in/
+# Output folders the tools create
+White Background/
+Too small - reshoot/
 
-# Other files and folders
-.settings/
+# Product photos (keep them out of the repo)
+*.jpg
+*.jpeg
+*.png
+*.heic
+*.heif
+*.webp
+*.tif
+*.tiff
+*.bmp
+*.psd
 
-# Executables
-*.swf
-*.air
-*.ipa
-*.apk
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
 
-# Project files, i.e. `.project`, `.actionScriptProperties` and `.flexProperties`
-# should NOT be excluded as they contain compiler settings and other important
-# information for Eclipse / Flash Builder.
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
