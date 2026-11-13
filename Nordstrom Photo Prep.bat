@@ -115,21 +115,38 @@ def compose(img, mask, W, H, margin):
     return canvas, scale
 
 
-def process_one(path, folder, s, session):
-    """Returns (status, detail, output_path)."""
-    W, H, margin = s["width"], s["height"], s["margin"] / 100
-    img = ImageOps.exif_transpose(Image.open(path))
-    img = to_srgb(img.convert("RGB")).convert("RGB")
-    if s["remove_bg"]:
-        from rembg import remove
-        mask = remove(img, session=session, only_mask=True,
-                      post_process_mask=(s.get("quality") == "fast"))
-    else:
-        mask = mask_from_white(img)
-    canvas, scale = compose(img, mask, W, H, margin)
-    if canvas is None:
-        return "No product found", "", None
+EDIT_DIR = ".photoprep"   # per-folder data for touch-ups (AI masks + edit markers)
 
+
+def mask_path(folder, path):
+    return Path(folder) / EDIT_DIR / f"{Path(path).stem}.mask.png"
+
+
+def edited_flag(folder, path):
+    return Path(folder) / EDIT_DIR / f"{Path(path).stem}.edited"
+
+
+def ensure_edit_dir(folder):
+    d = Path(folder) / EDIT_DIR
+    if not d.exists():
+        d.mkdir()
+        if os.name == "nt":
+            try:
+                import ctypes
+                ctypes.windll.kernel32.SetFileAttributesW(str(d), 2)  # hidden folder
+            except Exception:
+                pass
+    return d
+
+
+def load_source(path):
+    img = ImageOps.exif_transpose(Image.open(path))
+    return to_srgb(img.convert("RGB")).convert("RGB")
+
+
+def save_output(canvas, scale, path, folder, s, note=""):
+    """Write the finished image; returns (status, detail, output_path)."""
+    path, folder = Path(path), Path(folder)
     dest_dir, status, detail = folder / s["out_name"], "Done", ""
     if scale > 1.02:
         if s["allow_up"] and scale <= s["max_up"]:
@@ -137,7 +154,11 @@ def process_one(path, folder, s, session):
         else:
             dest_dir, status, detail = folder / SMALL_NAME, "Too small", f"needs {scale:.2f}x enlargement"
     dest_dir.mkdir(exist_ok=True)
-
+    for d in (folder / s["out_name"], folder / SMALL_NAME):   # no stale copy left in the other folder
+        for ext in (".jpg", ".png"):
+            old = d / f"{path.stem}{ext}"
+            if old.exists() and old.parent != dest_dir:
+                old.unlink()
     if s["fmt"] == "png":
         dest = dest_dir / f"{path.stem}.png"
         canvas.save(dest, dpi=(300, 300), icc_profile=SRGB_BYTES, optimize=True)
@@ -147,9 +168,347 @@ def process_one(path, folder, s, session):
             canvas.save(dest, quality=q, subsampling=0, dpi=(300, 300), icc_profile=SRGB_BYTES)
             if dest.stat().st_size < MAX_MB * 1024 * 1024:
                 break
+    notes = [n for n in (detail, note) if n]
     if not NAME_OK.match(path.stem):
-        detail = (detail + "; " if detail else "") + "name not Brand_VPN_Color"
-    return status, detail, dest
+        notes.append("name not Brand_VPN_Color")
+    return status, "; ".join(notes), dest
+
+
+def process_one(path, folder, s, session, keep_edits=True):
+    """Returns (status, detail, output_path)."""
+    W, H, margin = s["width"], s["height"], s["margin"] / 100
+    img = load_source(path)
+    mp, flag = mask_path(folder, path), edited_flag(folder, path)
+    mask, note = None, ""
+    if keep_edits and flag.exists() and mp.exists():
+        mask = Image.open(mp).convert("L")
+        if mask.size == img.size:
+            note = "touched up"
+        else:
+            mask = None
+    if mask is None:
+        if s["remove_bg"]:
+            from rembg import remove
+            mask = remove(img, session=session, only_mask=True,
+                          post_process_mask=(s.get("quality") == "fast"))
+        else:
+            mask = mask_from_white(img)
+        ensure_edit_dir(folder)
+        mask.save(mp, compress_level=1)
+        if flag.exists():
+            flag.unlink()
+    canvas, scale = compose(img, mask, W, H, margin)
+    if canvas is None:
+        return "No product found", "", None
+    return save_output(canvas, scale, path, folder, s, note)
+
+
+# ------------------------------------------------------------ touch-up editor
+
+
+class TouchUpWindow(tk.Toplevel):
+    """Paint the cut-out mask by hand: Restore brings back parts of the shoe,
+    Erase removes background the AI kept. Saves a new finished image."""
+
+    def __init__(self, master, app, src, folder, on_saved=None):
+        super().__init__(master)
+        self.app, self.src, self.folder, self.on_saved = app, Path(src), Path(folder), on_saved
+        self.title(f"Touch up - {self.src.name}")
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        self.geometry(f"{min(1200, sw - 60)}x{min(980, sh - 70)}")
+        self.minsize(700, 560)
+
+        self.img_full = load_source(self.src)
+        self.mask_full = Image.open(mask_path(self.folder, self.src)).convert("L")
+        bb = self.mask_full.point(lambda a: 255 if a > 40 else 0).getbbox() or (0, 0, *self.img_full.size)
+        pw, ph = int((bb[2] - bb[0]) * 0.12) + 40, int((bb[3] - bb[1]) * 0.12) + 40
+        W, H = self.img_full.size
+        self.box = (max(bb[0] - pw, 0), max(bb[1] - ph, 0), min(bb[2] + pw, W), min(bb[3] + ph, H))
+        self.img = self.img_full.crop(self.box)          # work area around the product
+        self.mask = self.mask_full.crop(self.box)
+        self.undo, self.redo, self.dirty = [], [], False
+        self.z, self.vx, self.vy = 1.0, 0.0, 0.0           # zoom and top-left of view (work-area px)
+        self._photo, self._job, self._stroke = None, None, None
+        self._pan = None
+
+        # toolbar
+        tb = ttk.Frame(self, padding=(10, 8))
+        tb.pack(fill="x")
+        self.v_mode = tk.StringVar(value="erase")
+        ttk.Radiobutton(tb, text="Erase (E)", value="erase", variable=self.v_mode, command=self.draw_cursor).pack(side="left")
+        ttk.Radiobutton(tb, text="Restore (R)", value="restore", variable=self.v_mode, command=self.draw_cursor).pack(side="left", padx=(8, 16))
+        ttk.Label(tb, text="Brush").pack(side="left")
+        self.v_size = tk.DoubleVar(value=40)
+        ttk.Scale(tb, from_=2, to=400, variable=self.v_size, length=150,
+                  command=lambda v: self.lbl_size.config(text=f"{float(v):.0f} px")).pack(side="left", padx=4)
+        self.lbl_size = ttk.Label(tb, text="40 px", width=7)
+        self.lbl_size.pack(side="left")
+        ttk.Label(tb, text="Softness").pack(side="left", padx=(10, 0))
+        self.v_soft = tk.DoubleVar(value=1)
+        ttk.Scale(tb, from_=0, to=10, variable=self.v_soft, length=90).pack(side="left", padx=4)
+        self.v_view = tk.StringVar(value="result")
+        ttk.Radiobutton(tb, text="Result", value="result", variable=self.v_view, command=self.render).pack(side="left", padx=(16, 0))
+        ttk.Radiobutton(tb, text="Show removed in red", value="overlay", variable=self.v_view, command=self.render).pack(side="left", padx=6)
+
+        bar = ttk.Frame(self, padding=(10, 6, 10, 10))
+        bar.pack(fill="x", side="bottom")
+        ttk.Button(bar, text="Undo", command=self.do_undo).pack(side="left")
+        ttk.Button(bar, text="Redo", command=self.do_redo).pack(side="left", padx=4)
+        ttk.Button(bar, text="Fit", command=self.fit).pack(side="left", padx=(12, 0))
+        ttk.Button(bar, text="100%", command=lambda: self.zoom_at(1.0 / self.z, None)).pack(side="left", padx=4)
+        ttk.Button(bar, text="Reset to AI result", command=self.reset_ai).pack(side="left", padx=(12, 0))
+        ttk.Button(bar, text="Save", style="Big.TButton", command=self.save).pack(side="right")
+        ttk.Button(bar, text="Cancel", command=self.close).pack(side="right", padx=8)
+        self.lbl_info = ttk.Label(bar, foreground="#666")
+        self.lbl_info.pack(side="right", padx=12)
+        ttk.Label(self, foreground="#888", padding=(10, 0),
+                  text="Left-drag paints  ·  Right-drag or Space+drag pans  ·  Wheel zooms  ·  [ ] brush size  ·  "
+                       "E/R switch  ·  Ctrl+Z / Ctrl+Y").pack(side="bottom", anchor="w")
+
+        self.canvas = tk.Canvas(self, bg="#9a9a9a", highlightthickness=0, cursor="none")
+        self.canvas.pack(fill="both", expand=True, padx=10)
+        c = self.canvas
+        c.bind("<Configure>", lambda e: self.fit() if not getattr(self, "_fitted", False) else self.schedule())
+        c.bind("<ButtonPress-1>", self.stroke_start)
+        c.bind("<B1-Motion>", self.stroke_move)
+        c.bind("<ButtonRelease-1>", self.stroke_end)
+        for b in ("<ButtonPress-3>", "<ButtonPress-2>"):
+            c.bind(b, self.pan_start)
+        for b in ("<B3-Motion>", "<B2-Motion>"):
+            c.bind(b, self.pan_move)
+        c.bind("<Motion>", lambda e: self.draw_cursor(e))
+        c.bind("<Leave>", lambda e: c.delete("cursor"))
+        c.bind("<MouseWheel>", lambda e: self.zoom_at(1.25 if e.delta > 0 else 0.8, e))
+        c.bind("<Button-4>", lambda e: self.zoom_at(1.25, e))
+        c.bind("<Button-5>", lambda e: self.zoom_at(0.8, e))
+        self.bind("<KeyPress-space>", lambda e: setattr(self, "_space", True))
+        self.bind("<KeyRelease-space>", lambda e: setattr(self, "_space", False))
+        self.bind("<Key-e>", lambda e: (self.v_mode.set("erase"), self.draw_cursor()))
+        self.bind("<Key-r>", lambda e: (self.v_mode.set("restore"), self.draw_cursor()))
+        self.bind("<Key-bracketleft>", lambda e: self.set_size(self.v_size.get() / 1.25))
+        self.bind("<Key-bracketright>", lambda e: self.set_size(self.v_size.get() * 1.25))
+        self.bind("<Control-z>", lambda e: self.do_undo())
+        self.bind("<Control-y>", lambda e: self.do_redo())
+        self.bind("<Control-s>", lambda e: self.save())
+        self.bind("<Escape>", lambda e: self.close())
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self._space = False
+        self.transient(master)
+        self.focus_set()
+        self.update_info()
+
+    # ---- view
+    def fit(self):
+        cw, ch = max(self.canvas.winfo_width(), 100), max(self.canvas.winfo_height(), 100)
+        self.z = min(cw / self.img.width, ch / self.img.height) * 0.96
+        self.vx = (self.img.width - cw / self.z) / 2
+        self.vy = (self.img.height - ch / self.z) / 2
+        self._fitted = True
+        self.render()
+
+    def zoom_at(self, factor, e):
+        cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
+        px, py = (e.x, e.y) if e is not None else (cw / 2, ch / 2)
+        ix, iy = self.vx + px / self.z, self.vy + py / self.z
+        self.z = min(max(self.z * factor, 0.05), 8.0)
+        self.vx, self.vy = ix - px / self.z, iy - py / self.z
+        self.render()
+        if e is not None:
+            self.draw_cursor(e)
+
+    def pan_start(self, e):
+        self._pan = (e.x, e.y, self.vx, self.vy)
+
+    def pan_move(self, e):
+        if self._pan:
+            x0, y0, vx, vy = self._pan
+            self.vx, self.vy = vx - (e.x - x0) / self.z, vy - (e.y - y0) / self.z
+            self.schedule(15)
+
+    def schedule(self, ms=30):
+        if self._job:
+            self.after_cancel(self._job)
+        self._job = self.after(ms, self.render)
+
+    def render(self):
+        self._job = None
+        c = self.canvas
+        cw, ch = max(c.winfo_width(), 1), max(c.winfo_height(), 1)
+        x0, y0 = max(self.vx, 0), max(self.vy, 0)
+        x1, y1 = min(self.vx + cw / self.z, self.img.width), min(self.vy + ch / self.z, self.img.height)
+        c.delete("img")
+        if x1 <= x0 or y1 <= y0:
+            return
+        box = (int(x0), int(y0), int(x1) + 1, int(y1) + 1)
+        size = (max(1, round((box[2] - box[0]) * self.z)), max(1, round((box[3] - box[1]) * self.z)))
+        rs = Image.NEAREST if self.z >= 2 else Image.BILINEAR
+        im = self.img.crop(box).resize(size, rs, reducing_gap=2.0 if self.z < 1 else None)
+        mk = self.mask.crop(box).resize(size, rs, reducing_gap=2.0 if self.z < 1 else None)
+        if self.v_view.get() == "overlay":
+            red = Image.blend(im, Image.new("RGB", size, (255, 0, 0)), 0.55)
+            shown = Image.composite(im, red, mk)
+        else:
+            shown = Image.composite(im, Image.new("RGB", size, (255, 255, 255)), mk)
+        self._photo = ImageTk.PhotoImage(shown)
+        c.create_image(round((box[0] - self.vx) * self.z), round((box[1] - self.vy) * self.z),
+                       image=self._photo, anchor="nw", tags="img")
+        c.tag_raise("cursor")
+
+    def draw_cursor(self, e=None):
+        c = self.canvas
+        if e is not None:
+            self._mouse = (e.x, e.y)
+        if not hasattr(self, "_mouse"):
+            return
+        x, y = self._mouse
+        r = self.v_size.get() * self.z / 2
+        c.delete("cursor")
+        color = "#d32f2f" if self.v_mode.get() == "erase" else "#1e88e5"
+        c.create_oval(x - r, y - r, x + r, y + r, outline=color, width=2, tags="cursor")
+        c.create_oval(x - r - 1, y - r - 1, x + r + 1, y + r + 1, outline="white", width=1, tags="cursor")
+
+    def set_size(self, v):
+        v = min(max(v, 2), 400)
+        self.v_size.set(v)
+        self.lbl_size.config(text=f"{v:.0f} px")
+        self.draw_cursor()
+
+    def update_info(self):
+        self.lbl_info.config(text=f"Zoom {self.z * 100:.0f}%" + ("   ● unsaved edits" if self.dirty else ""))
+
+    # ---- painting
+    def to_img(self, e):
+        return self.vx + e.x / self.z, self.vy + e.y / self.z
+
+    def stroke_start(self, e):
+        if self._space:
+            return self.pan_start(e)
+        self._before = self.mask.copy()
+        self._stroke = [self.to_img(e)]
+        self.paint_segment(self._stroke[0], self._stroke[0])
+
+    def stroke_move(self, e):
+        if self._space:
+            return self.pan_move(e)
+        self.draw_cursor(e)
+        if self._stroke is None:
+            return
+        p = self.to_img(e)
+        self.paint_segment(self._stroke[-1], p)
+        self._stroke.append(p)
+        self.schedule(25)
+
+    def paint_segment(self, a, b):
+        from PIL import ImageDraw
+        d = ImageDraw.Draw(self.mask)
+        w = max(1, round(self.v_size.get()))
+        val = 0 if self.v_mode.get() == "erase" else 255
+        d.line([a, b], fill=val, width=w)
+        for (x, y) in (a, b):
+            d.ellipse([x - w / 2, y - w / 2, x + w / 2, y + w / 2], fill=val)
+
+    def stroke_end(self, e):
+        if self._pan and self._space:
+            self._pan = None
+            return
+        if self._stroke is None:
+            return
+        from PIL import ImageChops, ImageDraw, ImageFilter
+        w, soft = max(1, round(self.v_size.get())), self.v_soft.get()
+        xs = [p[0] for p in self._stroke]
+        ys = [p[1] for p in self._stroke]
+        m = w / 2 + soft * 3 + 4
+        bb = (max(int(min(xs) - m), 0), max(int(min(ys) - m), 0),
+              min(int(max(xs) + m) + 1, self.mask.width), min(int(max(ys) + m) + 1, self.mask.height))
+        if bb[2] > bb[0] and bb[3] > bb[1]:
+            before = self._before.crop(bb)
+            if soft > 0:   # redo the stroke with feathered edges
+                layer = Image.new("L", (bb[2] - bb[0], bb[3] - bb[1]), 0)
+                d = ImageDraw.Draw(layer)
+                pts = [(x - bb[0], y - bb[1]) for x, y in self._stroke]
+                d.line(pts if len(pts) > 1 else pts * 2, fill=255, width=w)
+                for x, y in pts:
+                    d.ellipse([x - w / 2, y - w / 2, x + w / 2, y + w / 2], fill=255)
+                layer = layer.filter(ImageFilter.GaussianBlur(soft))
+                if self.v_mode.get() == "erase":
+                    new = ImageChops.darker(before, ImageChops.invert(layer))
+                else:
+                    new = ImageChops.lighter(before, layer)
+                self.mask.paste(new, bb[:2])
+            self.undo.append((bb, before))
+            self.redo.clear()
+            if len(self.undo) > 60:
+                self.undo.pop(0)
+            self.dirty = True
+        self._stroke, self._before = None, None
+        self.update_info()
+        self.render()
+
+    def do_undo(self):
+        if self.undo:
+            bb, patch = self.undo.pop()
+            self.redo.append((bb, self.mask.crop(bb)))
+            self.mask.paste(patch, bb[:2])
+            self.dirty = True
+            self.update_info()
+            self.render()
+
+    def do_redo(self):
+        if self.redo:
+            bb, patch = self.redo.pop()
+            self.undo.append((bb, self.mask.crop(bb)))
+            self.mask.paste(patch, bb[:2])
+            self.dirty = True
+            self.update_info()
+            self.render()
+
+    def reset_ai(self):
+        if not messagebox.askyesno("Touch up", "Throw away all touch-ups on this photo and go back to the "
+                                                "AI result? (The photo will be re-run through the AI when you save.)", parent=self):
+            return
+        self._reset = True
+        self.save()
+
+    # ---- save / close
+    def save(self):
+        s = dict(self.app.s["current"])
+        self.config(cursor="watch")
+        self.update_idletasks()
+        try:
+            if getattr(self, "_reset", False):
+                flag = edited_flag(self.folder, self.src)
+                if flag.exists():
+                    flag.unlink()
+                session = self.app.get_session(s.get("quality", "best")) if s["remove_bg"] else None
+                status, detail, dest = process_one(self.src, self.folder, s, session, keep_edits=False)
+            else:
+                full = self.mask_full.copy()
+                full.paste(self.mask, self.box[:2])
+                ensure_edit_dir(self.folder)
+                full.save(mask_path(self.folder, self.src), compress_level=1)
+                edited_flag(self.folder, self.src).write_text("touched up by hand\n")
+                canvas, scale = compose(self.img_full, full, s["width"], s["height"], s["margin"] / 100)
+                if canvas is None:
+                    messagebox.showerror("Touch up", "Nothing left to save - the whole shoe is erased.", parent=self)
+                    return
+                status, detail, dest = save_output(canvas, scale, self.src, self.folder, s, "touched up")
+        except Exception as e:
+            messagebox.showerror("Touch up", f"Couldn't save:\n{e}", parent=self)
+            return
+        finally:
+            try:
+                self.config(cursor="")
+            except tk.TclError:
+                pass
+        if self.on_saved:
+            self.on_saved(str(self.src), status, detail, dest)
+        self.dirty = False
+        self.destroy()
+
+    def close(self):
+        if self.dirty and not messagebox.askyesno("Touch up", "Discard your touch-ups on this photo?", parent=self):
+            return
+        self.destroy()
 
 
 # -------------------------------------------------------------- review window
@@ -192,6 +551,7 @@ class ReviewWindow(tk.Toplevel):
         ttk.Button(bar, text="Close", command=self.destroy).pack(side="right")
         ttk.Button(bar, text="Show in folder", command=self.show_in_folder).pack(side="right", padx=6)
         ttk.Button(bar, text="Open file", command=lambda: App.open_path(self.cur["out"])).pack(side="right")
+        ttk.Button(bar, text="✎ Touch up…", command=self.touch_up).pack(side="left", padx=(16, 0))
 
         opts = ttk.Frame(self, padding=(14, 0, 14, 0))
         opts.pack(fill="x", side="bottom")
@@ -201,7 +561,7 @@ class ReviewWindow(tk.Toplevel):
         self.v_problems = tk.BooleanVar(value=False)
         ttk.Checkbutton(opts, text="Only show problems", variable=self.v_problems,
                         command=self.apply_filter).pack(side="right")
-        ttk.Label(self, text="← → to move  ·  Space flips before/after  ·  Esc closes",
+        ttk.Label(self, text="← → to move  ·  Space flips before/after  ·  T touch up  ·  Esc closes",
                   foreground="#888", padding=(14, 0)).pack(side="bottom", anchor="w")
 
         self.canvas = tk.Canvas(self, bg="#c8c8c8", highlightthickness=0)
@@ -210,7 +570,8 @@ class ReviewWindow(tk.Toplevel):
 
         for key, fn in (("<Left>", lambda e: self.go(-1)), ("<Right>", lambda e: self.go(1)),
                         ("<Home>", lambda e: self.jump(0)), ("<End>", lambda e: self.jump(len(self.items) - 1)),
-                        ("<space>", lambda e: self.flip()), ("<Escape>", lambda e: self.destroy())):
+                        ("<space>", lambda e: self.flip()), ("<Escape>", lambda e: self.destroy()),
+                        ("<Key-t>", lambda e: self.touch_up())):
             self.bind(key, fn)
         self.transient(master)
         self.focus_set()
@@ -289,6 +650,27 @@ class ReviewWindow(tk.Toplevel):
             self.canvas.create_image(x, ch // 2, image=ph)
             if n == 2:
                 self.canvas.create_text(x, 12, text=("Before", "After")[k], font=("Segoe UI", 10, "bold"))
+
+    def touch_up(self):
+        it = self.cur
+        app = self.master
+        if not mask_path(app.folder, it["src"]).exists():
+            messagebox.showinfo("Touch up", "Process this photo again first - this version of the app saves "
+                                            "the data the touch-up tool needs.", parent=self)
+            return
+        TouchUpWindow(self, app, it["src"], app.folder, on_saved=self.touched)
+
+    def touched(self, src, status, detail, dest):
+        self.master.update_result(src, status, detail, dest)
+        tag = {"Done": "ok", "Done (enlarged)": "warn"}.get(status, "bad")
+        for lst in (self.items, self.all_items):
+            for it in lst:
+                if it["src"] == src:
+                    it.update(status=status, detail=detail, out=dest, tag=tag)
+        self._cache.clear()
+        self.v_view.set("after")
+        self.show()
+        self.focus_set()
 
     def show_in_folder(self):
         p = str(self.cur["out"])
@@ -659,6 +1041,15 @@ class App(tk.Tk):
             d.mkdir(exist_ok=True)
             self.open_path(d)
 
+    def update_result(self, iid, status, detail, dest):
+        tag = {"Done": "ok", "Done (enlarged)": "warn"}.get(status, "bad")
+        if self.tree.exists(iid):
+            self.tree.item(iid, values=(self.tree.set(iid, "size"), status, detail), tags=(tag,))
+        if dest:
+            self.outputs[iid] = dest
+        self._thumbs.clear()
+        self.show_preview()
+
     def review(self, only=None):
         ids = only if only is not None else list(self.tree.get_children())
         items = []
@@ -728,12 +1119,21 @@ class App(tk.Tk):
             return
         if not self.read_ui_settings():
             return
+        edited = [p for p in self.files if edited_flag(self.folder, p).exists()]
+        keep = True
+        if edited:
+            ans = messagebox.askyesnocancel(APP, f"{len(edited)} photo(s) in this folder have hand touch-ups.\n\n"
+                                                 "Yes = keep the touch-ups (just rebuild those photos)\n"
+                                                 "No = throw them away and redo everything with the AI")
+            if ans is None:
+                return
+            keep = ans
         self.cancel.clear()
         self._run_items = []
         self.btn_go.config(state="disabled")
         self.btn_cancel.config(state="normal")
         self.prog.config(maximum=len(self.files), value=0)
-        self.worker = threading.Thread(target=self.run, args=(list(self.files), dict(self.s["current"]), self.folder), daemon=True)
+        self.worker = threading.Thread(target=self.run, args=(list(self.files), dict(self.s["current"]), self.folder, keep), daemon=True)
         self.worker.start()
 
     def get_session(self, quality):
@@ -745,7 +1145,7 @@ class App(tk.Tk):
             self.sessions[quality] = make_session(quality)
         return self.sessions[quality]
 
-    def run(self, files, s, folder):
+    def run(self, files, s, folder, keep_edits=True):
         try:
             session = self.get_session(s.get("quality", "best")) if s["remove_bg"] else None
             if not getattr(self, "_matting_ready", False):
@@ -761,7 +1161,7 @@ class App(tk.Tk):
                 self.q.put(("status", f"Processing {i} of {len(files)}: {p.name}"))
                 try:
                     try:
-                        status, detail, dest = process_one(p, folder, s, session)
+                        status, detail, dest = process_one(p, folder, s, session, keep_edits)
                     except Exception as e:
                         out_of_memory = isinstance(e, MemoryError) or "alloc" in str(e).lower()
                         if s.get("quality") != "best" or not out_of_memory:
@@ -770,8 +1170,10 @@ class App(tk.Tk):
                         s["quality"] = "fast"
                         self.sessions.pop("best", None)
                         session = self.get_session("fast")
-                        status, detail, dest = process_one(p, folder, s, session)
+                        status, detail, dest = process_one(p, folder, s, session, keep_edits)
                     tag = {"Done": "ok", "Done (enlarged)": "warn", "Too small": "bad"}.get(status, "bad")
+                    if "touched up" in detail and tag == "ok":
+                        tag = "ok"
                     counts["ok" if status.startswith("Done") else "small" if status == "Too small" else "fail"] += 1
                     self.q.put(("row", str(p), status, detail, tag, dest))
                 except Exception as e:

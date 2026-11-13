@@ -1,6 +1,7 @@
 # Output folders the tools create
 White Background/
 Too small - reshoot/
+.photoprep/
 
 # Product photos (keep them out of the repo)
 *.jpg

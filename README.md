@@ -41,6 +41,19 @@ When a batch finishes, a review window opens so you can check each finished phot
 
 Open it any time with the **Review…** button; it starts at the photo selected in the list.
 
+### Touching up by hand
+
+For anything the AI gets wrong, click **✎ Touch up…** in the review window (or press **T**):
+
+- **Erase (E)** paints away background the AI kept (shadows, bits of the floor); **Restore (R)** paints back parts of the shoe it cut off
+- **Brush** size (or **[** / **]**) and **Softness** for feathered edges
+- **Mouse wheel** zooms at the cursor; **right-drag** (or Space+drag) pans; **Fit** and **100%** buttons
+- **Show removed in red** highlights everything that's been cut away, so holes and leftovers are easy to spot
+- **Ctrl+Z / Ctrl+Y** undo and redo; **Reset to AI result** throws the touch-ups away
+- **Save** (Ctrl+S) rebuilds the finished image with the same size, centering and edge cleanup
+
+Touched-up photos are marked "touched up". When you process a folder again, the app asks whether to keep the touch-ups (fast — no AI needed) or redo everything with the AI. Touch-up data lives in a hidden `.photoprep` folder inside your photos folder.
+
 ### Settings profiles
 
 The app's settings (output size, white margin, JPG/PNG, results folder name, AI background removal, enlargement limit) can be saved as named profiles:
