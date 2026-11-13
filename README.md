@@ -28,6 +28,17 @@ Just double-click either file.
 
 Originals are never changed. Supported: JPG, PNG, HEIC, WEBP, TIFF, BMP.
 
+### Settings profiles
+
+The app's settings (output size, white margin, JPG/PNG, results folder name, AI background removal, enlargement limit) can be saved as named profiles:
+
+- **Nordstrom (default)** is built in and can't be changed, so you can always go back to the Nordstrom specs.
+- **Save as new…** saves the current settings under a new name. **Save** updates the selected profile; **Delete** removes it.
+- "● unsaved" next to the profile means the settings on screen differ from the saved profile.
+- Give each profile its own **Results folder** name so different setups don't overwrite each other's output.
+
+The app also remembers your last folder and the settings on screen when you close it. Everything is stored in `%APPDATA%\NordstromPhotoPrep\settings.json`, outside the repo.
+
 ### Too-small photos
 
 Nordstrom's guide says not to enlarge smaller images to meet size requirements. A photo that would need enlarging goes to a `Too small - reshoot` subfolder instead. In the app, **Allow enlarging small photos** lets you permit small enlargements (default limit 1.25×).
