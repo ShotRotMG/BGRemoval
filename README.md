@@ -28,6 +28,17 @@ Just double-click either file.
 
 Originals are never changed. Supported: JPG, PNG, HEIC, WEBP, TIFF, BMP.
 
+### Reviewing results
+
+When a batch finishes, a review window opens so you can check each finished photo one at a time:
+
+- **◀ Previous / Next ▶** or the arrow keys move between photos; Home/End jump to first/last
+- **After / Before / Side by side** views; **Space** flips between before and after
+- **Only show problems** skips to photos that were too small, enlarged, or have a naming warning
+- **Open file** and **Show in folder** for the current photo
+
+Open it any time with the **Review…** button; it starts at the photo selected in the list.
+
 ### Settings profiles
 
 The app's settings (output size, white margin, JPG/PNG, results folder name, AI background removal, enlargement limit) can be saved as named profiles:

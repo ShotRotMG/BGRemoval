@@ -117,6 +117,152 @@ def process_one(path, folder, s, session):
     return status, detail, dest
 
 
+# -------------------------------------------------------------- review window
+
+
+class ReviewWindow(tk.Toplevel):
+    """Step through finished photos one at a time."""
+    COLORS = {"ok": "#2e7d32", "warn": "#b26a00", "bad": "#c62828"}
+
+    def __init__(self, master, items, start=0):
+        super().__init__(master)
+        self.title("Review results")
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        self.geometry(f"{min(1000, sw - 80)}x{min(980, sh - 80)}")
+        self.minsize(560, 600)
+        self.all_items = items          # dicts: src, out, status, detail, tag
+        self.items = list(items)
+        self.i = min(start, len(items) - 1)
+        self._img, self._job, self._cache = None, None, {}
+
+        top = ttk.Frame(self, padding=(14, 10, 14, 4))
+        top.pack(fill="x")
+        self.lbl_name = ttk.Label(top, font=("Segoe UI", 13, "bold"))
+        self.lbl_name.pack(side="left")
+        self.lbl_count = ttk.Label(top, font=("Segoe UI", 11), foreground="#555")
+        self.lbl_count.pack(side="right")
+        info = ttk.Frame(self, padding=(14, 0, 14, 6))
+        info.pack(fill="x")
+        self.lbl_status = ttk.Label(info, font=("Segoe UI", 10, "bold"))
+        self.lbl_status.pack(side="left")
+        self.lbl_detail = ttk.Label(info, foreground="#555")
+        self.lbl_detail.pack(side="left", padx=10)
+
+        bar = ttk.Frame(self, padding=(14, 6, 14, 12))
+        bar.pack(fill="x", side="bottom")
+        self.btn_prev = ttk.Button(bar, text="◀  Previous", command=lambda: self.go(-1))
+        self.btn_prev.pack(side="left")
+        self.btn_next = ttk.Button(bar, text="Next  ▶", command=lambda: self.go(1))
+        self.btn_next.pack(side="left", padx=6)
+        ttk.Button(bar, text="Close", command=self.destroy).pack(side="right")
+        ttk.Button(bar, text="Show in folder", command=self.show_in_folder).pack(side="right", padx=6)
+        ttk.Button(bar, text="Open file", command=lambda: App.open_path(self.cur["out"])).pack(side="right")
+
+        opts = ttk.Frame(self, padding=(14, 0, 14, 0))
+        opts.pack(fill="x", side="bottom")
+        self.v_view = tk.StringVar(value="after")
+        for txt, val in (("After", "after"), ("Before", "before"), ("Side by side", "both")):
+            ttk.Radiobutton(opts, text=txt, value=val, variable=self.v_view, command=self.render).pack(side="left", padx=(0, 10))
+        self.v_problems = tk.BooleanVar(value=False)
+        ttk.Checkbutton(opts, text="Only show problems", variable=self.v_problems,
+                        command=self.apply_filter).pack(side="right")
+        ttk.Label(self, text="← → to move  ·  Space flips before/after  ·  Esc closes",
+                  foreground="#888", padding=(14, 0)).pack(side="bottom", anchor="w")
+
+        self.canvas = tk.Canvas(self, bg="#c8c8c8", highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True, padx=14, pady=4)
+        self.canvas.bind("<Configure>", lambda e: self.schedule())
+
+        for key, fn in (("<Left>", lambda e: self.go(-1)), ("<Right>", lambda e: self.go(1)),
+                        ("<Home>", lambda e: self.jump(0)), ("<End>", lambda e: self.jump(len(self.items) - 1)),
+                        ("<space>", lambda e: self.flip()), ("<Escape>", lambda e: self.destroy())):
+            self.bind(key, fn)
+        self.transient(master)
+        self.focus_set()
+        self.show()
+
+    @property
+    def cur(self):
+        return self.items[self.i]
+
+    def apply_filter(self):
+        keep = [it for it in self.all_items if it["tag"] != "ok"] if self.v_problems.get() else list(self.all_items)
+        if not keep:
+            messagebox.showinfo("Review results", "No problems - every photo came out Done.", parent=self)
+            self.v_problems.set(False)
+            return
+        current = self.cur["src"] if self.items else None
+        self.items = keep
+        self.i = next((n for n, it in enumerate(keep) if it["src"] == current), 0)
+        self.show()
+
+    def go(self, step):
+        self.jump(self.i + step)
+
+    def jump(self, n):
+        if 0 <= n < len(self.items) and n != self.i:
+            self.i = n
+            self.show()
+
+    def flip(self):
+        self.v_view.set("before" if self.v_view.get() == "after" else "after")
+        self.render()
+
+    def show(self):
+        it = self.cur
+        self.lbl_name.config(text=Path(it["src"]).name)
+        self.lbl_count.config(text=f"{self.i + 1} of {len(self.items)}")
+        self.lbl_status.config(text=it["status"], foreground=self.COLORS.get(it["tag"], "#333"))
+        self.lbl_detail.config(text=it["detail"])
+        self.btn_prev.config(state="normal" if self.i > 0 else "disabled")
+        self.btn_next.config(state="normal" if self.i < len(self.items) - 1 else "disabled")
+        self.render()
+        self.master.tree.selection_set(it["src"]) if self.master.tree.exists(it["src"]) else None
+
+    def schedule(self):
+        if self._job:
+            self.after_cancel(self._job)
+        self._job = self.after(120, self.render)
+
+    def load(self, path, box):
+        key = (str(path), box)
+        if key not in self._cache:
+            if len(self._cache) > 12:
+                self._cache.clear()
+            im = ImageOps.exif_transpose(Image.open(path)).convert("RGB")
+            im.thumbnail(box, Image.LANCZOS)
+            self._cache[key] = im
+        return self._cache[key]
+
+    def render(self):
+        self.canvas.delete("all")
+        cw, ch = max(self.canvas.winfo_width(), 100), max(self.canvas.winfo_height(), 100)
+        it, view = self.cur, self.v_view.get()
+        paths = {"after": [it["out"]], "before": [it["src"]], "both": [it["src"], it["out"]]}[view]
+        n = len(paths)
+        slot_w = (cw - 20 * (n - 1)) // n
+        self._img = []
+        for k, p in enumerate(paths):
+            try:
+                im = self.load(p, (slot_w - 10, ch - 10))
+            except Exception:
+                self.canvas.create_text(cw // 2, ch // 2, text="Can't open this image")
+                continue
+            ph = ImageTk.PhotoImage(im)
+            self._img.append(ph)
+            x = k * (slot_w + 20) + slot_w // 2
+            self.canvas.create_image(x, ch // 2, image=ph)
+            if n == 2:
+                self.canvas.create_text(x, 12, text=("Before", "After")[k], font=("Segoe UI", 10, "bold"))
+
+    def show_in_folder(self):
+        p = str(self.cur["out"])
+        if os.name == "nt":
+            subprocess.Popen(["explorer", "/select,", p])
+        else:
+            App.open_path(Path(p).parent)
+
+
 # ----------------------------------------------------------------------- app
 
 
@@ -130,6 +276,7 @@ class App(tk.Tk):
         self.s = self.load_settings()
         self.files, self.outputs = [], {}
         self.q, self.worker, self.cancel, self.session = queue.Queue(), None, threading.Event(), None
+        self._run_items = []
         self._thumbs = {}
         self.build()
         if self.s["folder"] and Path(self.s["folder"]).is_dir():
@@ -290,6 +437,7 @@ class App(tk.Tk):
         ttk.Button(top, text="Choose folder…", command=self.choose_folder).pack(side="left")
         ttk.Button(top, text="Refresh", command=lambda: self.folder and self.set_folder(self.folder)).pack(side="left", padx=(6, 0))
         ttk.Button(top, text="Open results", command=self.open_results).pack(side="left", padx=(6, 0))
+        ttk.Button(top, text="Review…", command=self.review).pack(side="left", padx=(6, 0))
 
         # bottom bar first, so it always stays visible
         self.v_status = tk.StringVar(value="Choose a folder of photos to start.")
@@ -344,7 +492,7 @@ class App(tk.Tk):
         prev.rowconfigure(0, weight=1)
         st = ttk.LabelFrame(right, text="Settings", padding=10)
         st.pack(fill="x", side="bottom")
-        ttk.Label(right, text="Double-click a photo to open the finished file.", foreground="#666").pack(anchor="w", pady=(4, 6), side="bottom")
+        ttk.Label(right, text="Double-click a photo to open the finished file. Review… steps through results.", foreground="#666").pack(anchor="w", pady=(4, 6), side="bottom")
         prev.pack(fill="both", expand=True)
         cur = self.s["current"]
         r = 0
@@ -464,6 +612,25 @@ class App(tk.Tk):
             d.mkdir(exist_ok=True)
             self.open_path(d)
 
+    def review(self, only=None):
+        ids = only if only is not None else list(self.tree.get_children())
+        items = []
+        for iid in ids:
+            out = self.outputs.get(iid)
+            if out and Path(out).exists() and self.tree.exists(iid):
+                status, detail = self.tree.set(iid, "status"), self.tree.set(iid, "detail")
+                tags = self.tree.item(iid, "tags")
+                tag = tags[0] if tags else ("bad" if "small" in status.lower() else "ok")
+                items.append({"src": iid, "out": out, "status": status, "detail": detail, "tag": tag})
+        if not items:
+            messagebox.showinfo(APP, "Nothing to review yet. Process some photos first.")
+            return
+        if getattr(self, "_review", None) and self._review.winfo_exists():
+            self._review.destroy()
+        sel = self.tree.selection()
+        start = next((n for n, it in enumerate(items) if sel and it["src"] == sel[0]), 0) if only is None else 0
+        self._review = ReviewWindow(self, items, start)
+
     def open_selected_output(self):
         sel = self.tree.selection()
         if sel and sel[0] in self.outputs:
@@ -515,6 +682,7 @@ class App(tk.Tk):
         if not self.read_ui_settings():
             return
         self.cancel.clear()
+        self._run_items = []
         self.btn_go.config(state="disabled")
         self.btn_cancel.config(state="normal")
         self.prog.config(maximum=len(self.files), value=0)
@@ -569,6 +737,8 @@ class App(tk.Tk):
                         self.tree.item(iid, values=(size, status, detail), tags=(tag,))
                         if dest:
                             self.outputs[iid] = dest
+                        if tag != "busy":
+                            self._run_items.append(iid)
                         if tag == "busy":
                             self.tree.see(iid)
                         if self.tree.selection() and self.tree.selection()[0] == iid:
@@ -578,6 +748,8 @@ class App(tk.Tk):
                 elif m[0] == "end":
                     self.btn_go.config(state="normal")
                     self.btn_cancel.config(state="disabled")
+                    if any(i in self.outputs for i in self._run_items):
+                        self.review(only=self._run_items)
         except queue.Empty:
             pass
         self.after(100, self.poll)
