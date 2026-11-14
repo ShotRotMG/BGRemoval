@@ -39,6 +39,10 @@ Originals are never changed. Supported: JPG, PNG, HEIC, WEBP, TIFF, BMP.
 
 If a photo has hand touch-ups, you're asked whether to keep them or redo it with the AI.
 
+### Speed
+
+The **Time** column shows how long each photo took, and the status bar shows elapsed time and an estimate of what's left. Click a finished photo to see where its time went (loading, each AI model, combining, edge cleanup, saving). Every run also adds a line per photo to `.photoprep/timings.csv` in the photos folder, so slow steps can be tracked down.
+
 ### Reviewing results
 
 When a batch finishes, a review window opens so you can check each finished photo one at a time:
@@ -59,6 +63,7 @@ For anything the AI gets wrong, click **✎ Touch up…** in the review window (
 - **Brush** size (or **[** / **]**) and **Softness** for feathered edges
 - **Mouse wheel** zooms at the cursor; **right-drag** (or Space+drag) pans; **Fit** and **100%** buttons
 - **Show removed in red** highlights everything that's been cut away, so holes and leftovers are easy to spot
+- **✨ Heal all wear (auto)** finds dark marks on light areas (dirt, specks, scuffs on white outsoles and socks) and heals them all in one go. **Strength** (Gentle / Normal / Strong) controls how much it picks up. It skips thin lines (stitching, tread grooves) and the outline, so expect to finish a few marks with the Heal brush. **Show healed in green** (or **G**) highlights every pixel that was changed; one Undo takes the whole pass back
 - **Ctrl+Z / Ctrl+Y** undo and redo; **Reset to AI result** throws the touch-ups away
 - **Save** (Ctrl+S) rebuilds the finished image with the same size, centering and edge cleanup
 

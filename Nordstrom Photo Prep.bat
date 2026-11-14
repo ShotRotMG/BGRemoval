@@ -190,14 +190,41 @@ def combine_masks(img, best, fast):
     return Image.fromarray(out.astype(np.uint8)), int(add.sum())
 
 
-def ai_mask(img, s, sessions):
+class timed:
+    """with timed(times, "stage"): ... adds the seconds spent to times["stage"]."""
+    def __init__(self, times, name):
+        self.times, self.name = times, name
+
+    def __enter__(self):
+        import time
+        self.t = time.perf_counter()
+
+    def __exit__(self, *a):
+        import time
+        if self.times is not None:
+            self.times[self.name] = self.times.get(self.name, 0) + time.perf_counter() - self.t
+
+
+STAGES = ["load", "AI best", "AI fast", "combine", "edges", "save"]
+
+
+def fmt_secs(t):
+    t = int(round(t))
+    return f"{t // 60}:{t % 60:02d}"
+
+
+def ai_mask(img, s, sessions, times=None):
     """Cut-out mask for img using the quality setting's model(s)."""
     from rembg import remove
     if s.get("quality") == "fast":
-        return remove(img, session=sessions["fast"], only_mask=True, post_process_mask=True)
-    best = remove(img, session=sessions["best"], only_mask=True)
-    fast = remove(img, session=sessions["fast"], only_mask=True)
-    return combine_masks(img, best, fast)[0]
+        with timed(times, "AI fast"):
+            return remove(img, session=sessions["fast"], only_mask=True, post_process_mask=True)
+    with timed(times, "AI best"):
+        best = remove(img, session=sessions["best"], only_mask=True)
+    with timed(times, "AI fast"):
+        fast = remove(img, session=sessions["fast"], only_mask=True)
+    with timed(times, "combine"):
+        return combine_masks(img, best, fast)[0]
 
 
 def save_output(canvas, scale, path, folder, s, note=""):
@@ -230,10 +257,11 @@ def save_output(canvas, scale, path, folder, s, note=""):
     return status, "; ".join(notes), dest
 
 
-def process_one(path, folder, s, session, keep_edits=True):
-    """Returns (status, detail, output_path)."""
+def process_one(path, folder, s, session, keep_edits=True, times=None):
+    """Returns (status, detail, output_path). Stage timings go into times (dict) if given."""
     W, H, margin = s["width"], s["height"], s["margin"] / 100
-    img = load_source(path)
+    with timed(times, "load"):
+        img = load_source(path)
     mp, flag = mask_path(folder, path), edited_flag(folder, path)
     mask, note = None, ""
     if keep_edits and flag.exists() and mp.exists():
@@ -245,18 +273,40 @@ def process_one(path, folder, s, session, keep_edits=True):
             mask = None
     if mask is None:
         if s["remove_bg"]:
-            mask = ai_mask(img, s, session)
+            mask = ai_mask(img, s, session, times)
         else:
             mask = mask_from_white(img)
         ensure_edit_dir(folder)
-        mask.save(mp, compress_level=1)
+        with timed(times, "save"):
+            mask.save(mp, compress_level=1)
         for old in (flag, retouch_path(folder, path)):
             if old.exists():
                 old.unlink()
-    canvas, scale = compose(img, mask, W, H, margin)
+    with timed(times, "edges"):
+        canvas, scale = compose(img, mask, W, H, margin)
     if canvas is None:
         return "No product found", "", None
-    return save_output(canvas, scale, path, folder, s, note)
+    with timed(times, "save"):
+        return save_output(canvas, scale, path, folder, s, note)
+
+
+def log_timings(folder, rows):
+    """Append per-photo stage timings to .photoprep/timings.csv (for finding slow spots)."""
+    import csv, datetime, platform
+    try:
+        d = ensure_edit_dir(folder)
+        f = d / "timings.csv"
+        new = not f.exists()
+        with open(f, "a", newline="") as fh:
+            w = csv.writer(fh)
+            if new:
+                w.writerow(["when", "photo", "quality", "total_s"] + [f"{x}_s" for x in STAGES] + ["cpus", "machine"])
+            now = datetime.datetime.now().isoformat(timespec="seconds")
+            for name, quality, total, times in rows:
+                w.writerow([now, name, quality, f"{total:.2f}"] + [f"{times.get(x, 0):.2f}" for x in STAGES]
+                           + [os.cpu_count(), platform.processor() or platform.machine()])
+    except OSError:
+        pass
 
 
 # ------------------------------------------------------------- AI heal (LaMa)
@@ -340,6 +390,63 @@ def apply_retouch(img, folder, path):
     return img
 
 
+def find_wear(img, mask, sensitivity=1.0):
+    """Find small dark marks (dirt, scuffs, specks) on light parts of the product.
+    Skips thin lines (stitching, tread grooves) and anything near the outline.
+    Returns an L image (255 = spot to heal) and the number of spots."""
+    import cv2
+    import numpy as np
+    a = np.asarray(img).astype(np.float32)
+    lum = a @ np.array([0.299, 0.587, 0.114], np.float32)
+    m = np.asarray(mask) > 200
+    size = max(m.shape) if not m.any() else max(np.ptp(np.nonzero(m)[0]), np.ptp(np.nonzero(m)[1]))
+    inner = cv2.erode(m.astype(np.uint8), np.ones((3, 3), np.uint8), iterations=max(3, int(size * 0.012))) > 0
+    k = max(21, int(size * 0.012) | 1)                      # neighbourhood ~1.2% of the shoe
+    local = cv2.medianBlur(np.clip(lum, 0, 255).astype(np.uint8), min(k, 255) | 1).astype(np.float32)
+    dark = local - lum                                      # how much darker than the surroundings
+    light = local > 150                                     # only light areas (white/cream rubber, socks)
+    area = inner & light
+    if area.sum() < 1000:
+        return Image.new("L", img.size, 0), 0
+    # threshold from this photo's own texture: darker than all but the darkest 0.3% of normal grooves
+    thr = max(22.0, float(np.percentile(dark[area], 99.7)) + 6.0) / sensitivity
+    cand = (dark > thr) & area
+    n, lab, st, _ = cv2.connectedComponentsWithStats(cand.astype(np.uint8), 8)
+    keep = np.zeros(n, bool)
+    max_area = (size * 0.03) ** 2
+    for i in range(1, n):
+        x, y, w, h, ar = st[i]
+        if ar < 6 or ar > max_area:
+            continue
+        long, short = max(w, h), max(min(w, h), 1)
+        fill = ar / float(w * h)
+        very_dark = dark[y:y + h, x:x + w][lab[y:y + h, x:x + w] == i].mean() > 2.2 * thr   # ink, scratches, dirt
+        if (long / short > 3 or fill < 0.35) and not very_dark:   # thin line: stitching / groove / seam
+            continue
+        keep[i] = True
+    spots = keep[lab]
+    spots = cv2.dilate(spots.astype(np.uint8) * 255, np.ones((5, 5), np.uint8), iterations=2)
+    return Image.fromarray(spots), int(keep.sum())
+
+
+def spot_groups(spots, tile=384):
+    """Split the spot mask into tiles so each AI fill works on a small, sharp area."""
+    import cv2
+    import numpy as np
+    arr = np.asarray(spots) > 0
+    n, lab, st, _ = cv2.connectedComponentsWithStats(arr.astype(np.uint8), 8)
+    groups = {}
+    for i in range(1, n):
+        x, y, w, h, _ = st[i]
+        key = ((x + w // 2) // tile, (y + h // 2) // tile)
+        groups.setdefault(key, []).append(i)
+    out = []
+    for ids in groups.values():
+        m = np.isin(lab, ids)
+        out.append(Image.fromarray((m * 255).astype(np.uint8)))
+    return out
+
+
 # ------------------------------------------------------------ touch-up editor
 
 
@@ -390,6 +497,16 @@ class TouchUpWindow(tk.Toplevel):
         self.v_view = tk.StringVar(value="result")
         ttk.Radiobutton(tb, text="Result", value="result", variable=self.v_view, command=self.render).pack(side="left", padx=(16, 0))
         ttk.Radiobutton(tb, text="Show removed in red", value="overlay", variable=self.v_view, command=self.render).pack(side="left", padx=6)
+        ttk.Radiobutton(tb, text="Show healed in green", value="healed", variable=self.v_view, command=self.render).pack(side="left", padx=6)
+        tb2 = ttk.Frame(self, padding=(10, 0, 10, 6))
+        tb2.pack(fill="x")
+        ttk.Button(tb2, text="✨ Heal all wear (auto)", command=self.heal_all).pack(side="left")
+        ttk.Label(tb2, text="Strength").pack(side="left", padx=(10, 4))
+        self.v_strength = tk.StringVar(value="Normal")
+        ttk.Combobox(tb2, textvariable=self.v_strength, values=["Gentle", "Normal", "Strong"], state="readonly",
+                     width=8).pack(side="left")
+        ttk.Label(tb2, foreground="#888", text="Finds dark marks on light areas and heals them. Check the result "
+                                               "with “Show healed in green”, then Undo or touch up by hand.").pack(side="left", padx=10)
 
         bar = ttk.Frame(self, padding=(10, 6, 10, 10))
         bar.pack(fill="x", side="bottom")
@@ -427,6 +544,7 @@ class TouchUpWindow(tk.Toplevel):
         self.bind("<Key-e>", lambda e: (self.v_mode.set("erase"), self.draw_cursor()))
         self.bind("<Key-r>", lambda e: (self.v_mode.set("restore"), self.draw_cursor()))
         self.bind("<Key-h>", lambda e: (self.v_mode.set("heal"), self.draw_cursor()))
+        self.bind("<Key-g>", lambda e: (self.v_view.set("healed" if self.v_view.get() != "healed" else "result"), self.render()))
         self.bind("<Key-bracketleft>", lambda e: self.set_size(self.v_size.get() / 1.25))
         self.bind("<Key-bracketright>", lambda e: self.set_size(self.v_size.get() * 1.25))
         self.bind("<Control-z>", lambda e: self.do_undo())
@@ -489,6 +607,12 @@ class TouchUpWindow(tk.Toplevel):
         if self.v_view.get() == "overlay":
             red = Image.blend(im, Image.new("RGB", size, (255, 0, 0)), 0.55)
             shown = Image.composite(im, red, mk)
+        elif self.v_view.get() == "healed":
+            from PIL import ImageChops
+            diff = ImageChops.difference(self.img.crop(box), self.orig.crop(box)).convert("L")
+            diff = diff.point(lambda v: 255 if v > 0 else 0).resize(size, Image.NEAREST)
+            green = Image.blend(im, Image.new("RGB", size, (0, 200, 0)), 0.6)
+            shown = Image.composite(green, Image.composite(im, Image.new("RGB", size, (255, 255, 255)), mk), diff)
         else:
             shown = Image.composite(im, Image.new("RGB", size, (255, 255, 255)), mk)
         self._photo = ImageTk.PhotoImage(shown)
@@ -651,6 +775,22 @@ class TouchUpWindow(tk.Toplevel):
         if not holes:
             self.canvas.delete("healstroke")
             return
+        self.run_heal(holes)
+
+    def heal_all(self):
+        if self._busy:
+            return
+        sens = {"Gentle": 0.8, "Normal": 1.0, "Strong": 1.3}[self.v_strength.get()]
+        spots, n = find_wear(self.img, self.mask, sens)
+        if n == 0:
+            messagebox.showinfo("Heal all wear", "No wear found at this strength. Try Strong, or use the Heal brush.", parent=self)
+            return
+        groups = spot_groups(spots)
+        self.lbl_info.config(text=f"Found {n} marks…")
+        self.run_heal(groups, after=lambda: (self.v_view.set("healed"), self.render(),
+                                            self.lbl_info.config(text=f"Healed {n} marks - green shows what changed")))
+
+    def run_heal(self, holes, after=None):
         self._busy = True
         self.config(cursor="watch")
         self.lbl_info.config(text="Healing…")
@@ -665,7 +805,7 @@ class TouchUpWindow(tk.Toplevel):
                     box, patch = heal_patch(work, hole)
                     patches.append((box, work.crop(box), patch))
                     work.paste(patch, box[:2])
-                self.after(0, lambda: self.heal_done(patches, None))
+                self.after(0, lambda: (self.heal_done(patches, None), after and after()))
             except Exception as e:
                 self.after(0, lambda e=e: self.heal_done([], e))
 
@@ -956,6 +1096,7 @@ class App(tk.Tk):
         self.files, self.outputs = [], {}
         self.q, self.worker, self.cancel, self.sessions = queue.Queue(), None, threading.Event(), {}
         self._run_items, self._on_done = [], None
+        self.timings = {}
         self._thumbs = {}
         self.build()
         if self.s["folder"] and Path(self.s["folder"]).is_dir():
@@ -1141,21 +1282,23 @@ class App(tk.Tk):
 
         left = ttk.Frame(body)
         body.add(left, weight=3)
-        cols = ("size", "status", "detail")
+        cols = ("size", "status", "time", "detail")
         self.tree = ttk.Treeview(left, columns=cols, selectmode="extended")
         self.tree.heading("#0", text="Photo")
         self.tree.heading("size", text="Size (px)")
         self.tree.heading("status", text="Status")
+        self.tree.heading("time", text="Time")
         self.tree.heading("detail", text="Notes")
         self.tree.column("#0", width=240)
         self.tree.column("size", width=90, anchor="center")
         self.tree.column("status", width=110, anchor="center")
+        self.tree.column("time", width=60, anchor="center")
         self.tree.column("detail", width=160)
         sb = ttk.Scrollbar(left, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.pack(side="left", fill="both", expand=True)
         sb.pack(side="left", fill="y")
-        self.tree.bind("<<TreeviewSelect>>", lambda e: self.show_preview())
+        self.tree.bind("<<TreeviewSelect>>", lambda e: (self.show_preview(), self.show_timing()))
         self._resize_job = None
         self.tree.bind("<Double-1>", lambda e: self.open_selected_output())
         self.menu = tk.Menu(self, tearoff=0)
@@ -1299,7 +1442,7 @@ class App(tk.Tk):
                     if o.exists():
                         self.outputs[str(p)] = o
             status = "Processed before" if str(p) in self.outputs else "Waiting"
-            self.tree.insert("", "end", iid=str(p), text=p.name, values=(size, status, note),
+            self.tree.insert("", "end", iid=str(p), text=p.name, values=(size, status, "", note),
                              tags=("warn",) if note else ())
         n = len(self.files)
         self.v_status.set(f"{n} photo(s) found." if n else "No photos in this folder.")
@@ -1313,6 +1456,14 @@ class App(tk.Tk):
             d.mkdir(exist_ok=True)
             self.open_path(d)
 
+    def show_timing(self):
+        sel = self.tree.selection()
+        if len(sel) != 1 or sel[0] not in self.timings or self.busy():
+            return
+        took, times = self.timings[sel[0]]
+        parts = [f"{k} {times[k]:.1f}s" for k in STAGES if times.get(k, 0) >= 0.05]
+        self.v_status.set(f"{Path(sel[0]).name}: {took:.1f}s  —  " + "  ·  ".join(parts))
+
     def popup(self, e):
         row = self.tree.identify_row(e.y)
         if row and row not in self.tree.selection():
@@ -1323,7 +1474,9 @@ class App(tk.Tk):
     def update_result(self, iid, status, detail, dest):
         tag = {"Done": "ok", "Done (enlarged)": "warn"}.get(status, "bad")
         if self.tree.exists(iid):
-            self.tree.item(iid, values=(self.tree.set(iid, "size"), status, detail), tags=(tag,))
+            self.tree.set(iid, "status", status)
+            self.tree.set(iid, "detail", detail)
+            self.tree.item(iid, tags=(tag,))
         if dest:
             self.outputs[iid] = dest
         self._thumbs.clear()
@@ -1452,21 +1605,29 @@ class App(tk.Tk):
 
     def run(self, files, s, folder, keep_edits=True):
         try:
+            import time
+            t_load = time.perf_counter()
             session = self.get_session(s.get("quality", "best")) if s["remove_bg"] else None
             if not getattr(self, "_matting_ready", False):
                 self.q.put(("status", "Preparing edge tools (first time can take a minute)…"))
                 import pymatting  # noqa  (first import compiles; slow once)
                 self._matting_ready = True
             counts = {"ok": 0, "small": 0, "fail": 0}
+            setup = time.perf_counter() - t_load
+            t_run, done_times, log_rows = time.perf_counter(), [], []
             for i, p in enumerate(files, 1):
                 if self.cancel.is_set():
                     self.q.put(("status", "Stopped."))
                     break
                 self.q.put(("row", str(p), "Working…", "", "busy", None))
-                self.q.put(("status", f"Processing {i} of {len(files)}: {p.name}"))
+                msg = f"Processing {i} of {len(files)}: {p.name}   ·   {fmt_secs(time.perf_counter() - t_run)} elapsed"
+                if done_times:
+                    msg += f", about {fmt_secs(sum(done_times) / len(done_times) * (len(files) - i + 1))} left"
+                self.q.put(("status", msg))
+                times, t0 = {}, time.perf_counter()
                 try:
                     try:
-                        status, detail, dest = process_one(p, folder, s, session, keep_edits)
+                        status, detail, dest = process_one(p, folder, s, session, keep_edits, times)
                     except Exception as e:
                         out_of_memory = isinstance(e, MemoryError) or "alloc" in str(e).lower()
                         if s.get("quality") != "best" or not out_of_memory:
@@ -1475,7 +1636,8 @@ class App(tk.Tk):
                         s["quality"] = "fast"
                         self.sessions.pop("best", None)
                         session = self.get_session("fast")
-                        status, detail, dest = process_one(p, folder, s, session, keep_edits)
+                        times = {}
+                        status, detail, dest = process_one(p, folder, s, session, keep_edits, times)
                     tag = {"Done": "ok", "Done (enlarged)": "warn", "Too small": "bad"}.get(status, "bad")
                     if "touched up" in detail and tag == "ok":
                         tag = "ok"
@@ -1484,11 +1646,22 @@ class App(tk.Tk):
                 except Exception as e:
                     counts["fail"] += 1
                     self.q.put(("row", str(p), "Failed", str(e)[:120], "bad", None))
+                took = time.perf_counter() - t0
+                done_times.append(took)
+                log_rows.append((p.name, s.get("quality", "best") if s["remove_bg"] else "no-AI", took, times))
+                self.q.put(("time", str(p), took, times))
                 self.q.put(("prog", i))
-            else:
-                msg = f"Finished: {counts['ok']} ready in '{s['out_name']}'."
+            log_timings(folder, log_rows)
+            if done_times:
+                self._last_run = (len(done_times), time.perf_counter() - t_run, setup)
+            if not self.cancel.is_set():
+                total = time.perf_counter() - t_run
+                msg = (f"Finished {len(done_times)} photo(s) in {fmt_secs(total)} "
+                       f"(avg {total / max(len(done_times), 1):.1f}s each"
+                       + (f", +{setup:.0f}s loading models" if setup >= 1 else "") + ").  "
+                       f"{counts['ok']} ready in '{s['out_name']}'.")
                 if counts["small"]:
-                    msg += f"  {counts['small']} too small (in '{SMALL_NAME}')."
+                    msg += f"  {counts['small']} too small."
                 if counts["fail"]:
                     msg += f"  {counts['fail']} failed."
                 self.q.put(("status", msg))
@@ -1507,8 +1680,11 @@ class App(tk.Tk):
                 elif m[0] == "row":
                     _, iid, status, detail, tag, dest = m
                     if self.tree.exists(iid):
-                        size = self.tree.set(iid, "size")
-                        self.tree.item(iid, values=(size, status, detail), tags=(tag,))
+                        self.tree.set(iid, "status", status)
+                        self.tree.set(iid, "detail", detail)
+                        if tag == "busy":
+                            self.tree.set(iid, "time", "…")
+                        self.tree.item(iid, tags=(tag,))
                         if dest:
                             self.outputs[iid] = dest
                         if tag != "busy":
@@ -1517,6 +1693,11 @@ class App(tk.Tk):
                             self.tree.see(iid)
                         if self.tree.selection() and self.tree.selection()[0] == iid:
                             self.show_preview()
+                elif m[0] == "time":
+                    _, iid, took, times = m
+                    self.timings[iid] = (took, times)
+                    if self.tree.exists(iid):
+                        self.tree.set(iid, "time", f"{took:.1f}s")
                 elif m[0] == "warn":
                     messagebox.showwarning(APP, m[1])
                 elif m[0] == "error":
