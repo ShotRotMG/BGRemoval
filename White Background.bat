@@ -82,8 +82,8 @@ def local_backdrop(lum, product):
 
 def combine_masks(img, best, fast):
     """best/fast: L masks from the two AI models. Best is cleaner but can miss white parts on a
-    light backdrop (white toe caps, rubber sidewalls). Adds back regions only the fast model kept
-    when it's confident and they aren't shadows (shadows are much darker than the backdrop)."""
+    light backdrop (white toe caps, rubber sidewalls). Adds back what the fast model sees there
+    when it isn't a shadow, fills gaps enclosed by the shoe, and seals thin light seams."""
     import cv2
     import numpy as np
     a = np.asarray(img).astype(np.float32)
@@ -94,8 +94,6 @@ def combine_masks(img, best, fast):
     bg = local_backdrop(lum, union)
     extra = (F > 128) & (B < 128)                      # parts only the fast model kept
     n, lab, stats, _ = cv2.connectedComponentsWithStats(extra.astype(np.uint8), 8)
-    if n <= 1:
-        return best, 0
     near = cv2.dilate((B > 128).astype(np.uint8), np.ones((15, 15), np.uint8)) > 0
     touch = np.zeros(n, bool)
     touch[np.unique(lab[near & extra])] = True
@@ -105,11 +103,53 @@ def combine_masks(img, best, fast):
             continue
         m = lab == i
         not_shadow = np.median(lum[m] - bg[m]) > -25      # shadows are much darker than the backdrop
-        confident = (F[m] > 250).mean() > 0.5              # fast model is sure it's product
+        confident = (F[m] > 250).mean() > 0.25 or np.median(F[m]) > 235   # fast model is sure it's product
         keep[i] = not_shadow and confident
     add = keep[lab]
     out = np.where(add, np.maximum(B, F), B)
-    return Image.fromarray(out.astype(np.uint8)), int(add.sum())
+    # second pass: thick regions the fast model half-believes (35+ of 255) next to the shoe that
+    # aren't shadows - e.g. a white toe cap. Thin halos around edges are removed by the opening.
+    k = max(15, int(max(h_ := out.shape[0], out.shape[1]) * 0.006)) | 1
+    soft = ((F > 35) & (out < 128)).astype(np.uint8)
+    soft = cv2.morphologyEx(soft, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    n3, lab3, st3, _ = cv2.connectedComponentsWithStats(soft, 8)
+    near2 = cv2.dilate((out > 128).astype(np.uint8), np.ones((k, k), np.uint8)) > 0
+    region = np.zeros(out.shape, bool)
+    for i in range(1, n3):
+        if st3[i, cv2.CC_STAT_AREA] < 0.002 * lum.size:
+            continue
+        m = lab3 == i
+        if (near2 & m).any() and np.median(lum[m] - bg[m]) > -25:
+            region |= m
+    if region.any():
+        region = cv2.morphologyEx(region.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((k, k), np.uint8)) > 0
+        soft_edge = cv2.GaussianBlur(region.astype(np.float32) * 255, (0, 0), 2)
+        out = np.maximum(out, soft_edge)
+    extra_px = int(region.sum())
+    # fill gaps fully enclosed by the shoe (e.g. a white toe cap inside its rubber rim) when the
+    # fast model partly sees product there; real openings (sandal straps) score near zero and stay open
+    solid = (out > 128).astype(np.uint8)
+    prod_area = max(int(solid.sum()), 1)
+    inv = 1 - solid
+    n2, lab2, st2, _ = cv2.connectedComponentsWithStats(inv, 4)
+    h, w = solid.shape
+    filled = 0
+    for i in range(1, n2):
+        x, y, bw, bh, ar = st2[i]
+        if x == 0 or y == 0 or x + bw >= w or y + bh >= h:      # touches the photo edge: real background
+            continue
+        m = lab2 == i
+        tiny = ar < 0.01 * prod_area                       # slivers/notches inside the shoe outline
+        if (F[m].mean() > 90 or (tiny and F[m].mean() > 30)) and np.median(lum[m] - bg[m]) > -25:
+            out[m] = np.maximum(out[m], np.maximum(F[m], 230))
+            filled += int(ar)
+    # seal thin half-transparent seams between solid parts (e.g. toe cap meeting its rubber rim)
+    ks = max(9, int(max(out.shape) * 0.004)) | 1
+    closed = cv2.morphologyEx(out.astype(np.uint8), cv2.MORPH_CLOSE,
+                              cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks))).astype(np.float32)
+    seam = (closed > out + 20) & (F > 30) & (lum > bg - 25)       # never seal dark gaps (tread lugs, shadows)
+    out = np.where(seam, closed, out)
+    return Image.fromarray(out.astype(np.uint8)), int(add.sum()) + filled + extra_px + int(seam.sum())
 
 
 def ai_mask(img, s, sessions):
