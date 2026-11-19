@@ -621,7 +621,8 @@ class TouchUpWindow(tk.Toplevel):
         self.v_soft = tk.DoubleVar(value=1)
         ttk.Scale(tb, from_=0, to=10, variable=self.v_soft, length=90).pack(side="left", padx=4)
         self.v_view = tk.StringVar(value="result")
-        ttk.Radiobutton(tb, text="Result", value="result", variable=self.v_view, command=self.render).pack(side="left", padx=(16, 0))
+        ttk.Radiobutton(tb, text="Before", value="before", variable=self.v_view, command=self.render).pack(side="left", padx=(16, 0))
+        ttk.Radiobutton(tb, text="Result", value="result", variable=self.v_view, command=self.render).pack(side="left", padx=6)
         ttk.Radiobutton(tb, text="Show removed in red", value="overlay", variable=self.v_view, command=self.render).pack(side="left", padx=6)
         ttk.Radiobutton(tb, text="Show healed in green", value="healed", variable=self.v_view, command=self.render).pack(side="left", padx=6)
         tb2 = ttk.Frame(self, padding=(10, 0, 10, 6))
@@ -649,7 +650,7 @@ class TouchUpWindow(tk.Toplevel):
         self.qbar.pack(fill="x", side="bottom")
         ttk.Label(self, foreground="#888", padding=(10, 0),
                   text="Left-drag paints  ·  Right-drag or Space+drag pans  ·  Wheel zooms  ·  [ ] brush size  ·  "
-                       "E/R/H switch  ·  Ctrl+Z / Ctrl+Y").pack(side="bottom", anchor="w")
+                       "E/R/H switch  ·  B before/after  ·  G healed  ·  Ctrl+Z / Ctrl+Y").pack(side="bottom", anchor="w")
 
         self.canvas = tk.Canvas(self, bg="#9a9a9a", highlightthickness=0, cursor="none")
         self.canvas.pack(fill="both", expand=True, padx=10)
@@ -672,6 +673,7 @@ class TouchUpWindow(tk.Toplevel):
         self.bind("<Key-e>", lambda e: (self.v_mode.set("erase"), self.draw_cursor()))
         self.bind("<Key-r>", lambda e: (self.v_mode.set("restore"), self.draw_cursor()))
         self.bind("<Key-h>", lambda e: (self.v_mode.set("heal"), self.draw_cursor()))
+        self.bind("<Key-b>", lambda e: (self.v_view.set("before" if self.v_view.get() != "before" else "result"), self.render()))
         self.bind("<Key-g>", lambda e: (self.v_view.set("healed" if self.v_view.get() != "healed" else "result"), self.render()))
         self.bind("<Key-bracketleft>", lambda e: self.set_size(self.v_size.get() / 1.25))
         self.bind("<Key-bracketright>", lambda e: self.set_size(self.v_size.get() * 1.25))
@@ -733,7 +735,9 @@ class TouchUpWindow(tk.Toplevel):
         rs = Image.NEAREST if self.z >= 2 else Image.BILINEAR
         im = self.img.crop(box).resize(size, rs, reducing_gap=2.0 if self.z < 1 else None)
         mk = self.mask.crop(box).resize(size, rs, reducing_gap=2.0 if self.z < 1 else None)
-        if self.v_view.get() == "overlay":
+        if self.v_view.get() == "before":      # the original photo, untouched
+            shown = self.orig.crop(box).resize(size, rs, reducing_gap=2.0 if self.z < 1 else None)
+        elif self.v_view.get() == "overlay":
             red = Image.blend(im, Image.new("RGB", size, (255, 0, 0)), 0.55)
             shown = Image.composite(im, red, mk)
         elif self.v_view.get() == "healed":
@@ -744,7 +748,7 @@ class TouchUpWindow(tk.Toplevel):
             shown = Image.composite(green, Image.composite(im, Image.new("RGB", size, (255, 255, 255)), mk), diff)
         else:
             shown = Image.composite(im, Image.new("RGB", size, (255, 255, 255)), mk)
-        pend = self.pending_mask()
+        pend = self.pending_mask() if self.v_view.get() != "before" else None
         if pend is not None:      # queued / in-progress heals, drawn on the photo so they follow pan & zoom
             pm = pend.crop(box).resize(size, Image.NEAREST)
             if pm.getbbox():
