@@ -51,7 +51,7 @@ SETTINGS_FILE = Path(os.environ.get("APPDATA", Path.home())) / "NordstromPhotoPr
 BUILTIN = "Nordstrom (default)"
 BUILTIN_VALS = {"width": 2640, "height": 4048, "margin": 6.0, "fmt": "jpg", "remove_bg": True,
                 "allow_up": False, "max_up": 1.25, "out_name": OUT_NAME, "quality": "best",
-                "keep_size": False}
+                "keep_size": False, "match_orient": False}
 PROFILE_KEYS = list(BUILTIN_VALS)
 
 # ----------------------------------------------------------------- processing
@@ -84,6 +84,23 @@ def mask_from_white(img, tol=12):
     from PIL import ImageChops
     diff = ImageChops.difference(img, Image.new("RGB", img.size, "white")).convert("L")
     return diff.point(lambda v: 255 if v > tol else 0)
+
+
+def output_size(s, img_size):
+    """Final W x H for a photo. With match_orient, the set size is turned to match the photo:
+    a wide photo gets a wide frame, a tall photo a tall one."""
+    W, H = s["width"], s["height"]
+    if s.get("keep_size"):
+        return img_size
+    if s.get("match_orient"):
+        pw, ph = img_size
+        if (pw > ph) != (W > H) and pw != ph:
+            W, H = H, W
+    return W, H
+
+
+def orient_label(w, h):
+    return "wide" if w > h * 1.02 else "tall" if h > w * 1.02 else "square"
 
 
 def compose(img, mask, W, H, margin, keep_size=False):
@@ -360,9 +377,10 @@ def match_retouch_orientation(folder, path, img):
 
 def process_one(path, folder, s, session, keep_edits=True, times=None):
     """Returns (status, detail, output_path). Stage timings go into times (dict) if given."""
-    W, H, margin = s["width"], s["height"], s["margin"] / 100
+    margin = s["margin"] / 100
     with timed(times, "load"):
         img = load_source(path)
+    W, H = output_size(s, img.size)
     mp, flag = mask_path(folder, path), edited_flag(folder, path)
     mask, note = None, ""
     if keep_edits and flag.exists() and mp.exists():
@@ -977,7 +995,8 @@ class TouchUpWindow(tk.Toplevel):
                     img_used.paste(self.img, self.box[:2])
                 elif rp.exists():
                     rp.unlink()
-                canvas, scale = compose(img_used, full, s["width"], s["height"], s["margin"] / 100,
+                ow, oh = output_size(s, img_used.size)
+                canvas, scale = compose(img_used, full, ow, oh, s["margin"] / 100,
                                         s.get("keep_size", False))
                 if canvas is None:
                     messagebox.showerror("Touch up", "Nothing left to save - the whole shoe is erased.", parent=self)
@@ -1102,7 +1121,16 @@ class ReviewWindow(tk.Toplevel):
         self.lbl_name.config(text=Path(it["src"]).name)
         self.lbl_count.config(text=f"{self.i + 1} of {len(self.items)}")
         self.lbl_status.config(text=it["status"], foreground=self.COLORS.get(it["tag"], "#333"))
-        self.lbl_detail.config(text=it["detail"])
+        sizes = ""
+        try:
+            with Image.open(it["src"]) as a:
+                ow, oh = ImageOps.exif_transpose(a).size
+            with Image.open(it["out"]) as b:
+                nw, nh = b.size
+            sizes = f"Original {ow}×{oh} ({orient_label(ow, oh)})  →  Output {nw}×{nh}"
+        except Exception:
+            pass
+        self.lbl_detail.config(text="   ·   ".join(x for x in (it["detail"], sizes) if x))
         self.btn_prev.config(state="normal" if self.i > 0 else "disabled")
         self.btn_next.config(state="normal" if self.i < len(self.items) - 1 else "disabled")
         self.render()
@@ -1261,7 +1289,8 @@ class App(tk.Tk):
         return {"width": w, "height": h, "margin": round(float(self.v_margin.get()), 1),
                 "fmt": self.v_fmt.get(), "remove_bg": bool(self.v_rbg.get()),
                 "allow_up": bool(self.v_up.get()), "max_up": mu, "out_name": name,
-                "quality": self.v_quality.get(), "keep_size": keep}
+                "quality": self.v_quality.get(), "keep_size": keep,
+                "match_orient": bool(self.v_orient.get())}
 
     def read_ui_settings(self, quiet=False):
         vals = self.ui_values(quiet)
@@ -1284,6 +1313,7 @@ class App(tk.Tk):
         self.v_out.set(vals["out_name"])
         self.v_quality.set(vals.get("quality", "best"))
         self.v_keep.set(vals.get("keep_size", False))
+        self.v_orient.set(vals.get("match_orient", False))
         self.toggle_keep()
         self._loading = False
         self.update_dirty()
@@ -1293,7 +1323,7 @@ class App(tk.Tk):
         if not hasattr(self, "ent_w"):
             return
         state = "disabled" if self.v_keep.get() else "normal"
-        for w in (self.ent_w, self.ent_h):
+        for w in (self.ent_w, self.ent_h, self.chk_orient):
             w.config(state=state)
         if hasattr(self, "sc_margin"):
             self.sc_margin.config(state=state)
@@ -1416,7 +1446,7 @@ class App(tk.Tk):
         self.tree.heading("time", text="Time")
         self.tree.heading("detail", text="Notes")
         self.tree.column("#0", width=240)
-        self.tree.column("size", width=90, anchor="center")
+        self.tree.column("size", width=120, anchor="center")
         self.tree.column("status", width=110, anchor="center")
         self.tree.column("time", width=60, anchor="center")
         self.tree.column("detail", width=160)
@@ -1487,6 +1517,11 @@ class App(tk.Tk):
         self.v_keep = tk.BooleanVar(value=cur.get("keep_size", False))
         ttk.Checkbutton(sz, text="Keep original size", variable=self.v_keep,
                         command=self.toggle_keep).pack(side="left", padx=(10, 0))
+        r += 1
+        self.v_orient = tk.BooleanVar(value=cur.get("match_orient", False))
+        self.chk_orient = ttk.Checkbutton(st, text="Match photo orientation (wide photos get a wide frame)",
+                                          variable=self.v_orient)
+        self.chk_orient.grid(row=r, column=1, sticky="w")
 
         r += 1
         ttk.Label(st, text="White margin:").grid(row=r, column=0, sticky="w")
@@ -1540,7 +1575,7 @@ class App(tk.Tk):
         self.refresh_profiles()
         self.toggle_keep()
         for v in (self.v_w, self.v_h, self.v_margin, self.v_fmt, self.v_rbg, self.v_up, self.v_maxup, self.v_out,
-                  self.v_quality, self.v_keep):
+                  self.v_quality, self.v_keep, self.v_orient):
             v.trace_add("write", self.update_dirty)
         self.update_dirty()
 
@@ -1566,7 +1601,7 @@ class App(tk.Tk):
             try:
                 with Image.open(p) as im:
                     w, h = ImageOps.exif_transpose(im).size if im.format != "HEIF" else im.size
-                size = f"{w}×{h}"
+                size = f"{w}×{h} {orient_label(w, h)}"
                 note = "" if max(w, h) >= 2600 else "low resolution"
             except Exception:
                 size, note = "?", "can't read"
