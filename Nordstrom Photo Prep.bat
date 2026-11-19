@@ -50,7 +50,8 @@ SRGB_BYTES = ImageCms.ImageCmsProfile(SRGB).tobytes()
 SETTINGS_FILE = Path(os.environ.get("APPDATA", Path.home())) / "NordstromPhotoPrep" / "settings.json"
 BUILTIN = "Nordstrom (default)"
 BUILTIN_VALS = {"width": 2640, "height": 4048, "margin": 6.0, "fmt": "jpg", "remove_bg": True,
-                "allow_up": False, "max_up": 1.25, "out_name": OUT_NAME, "quality": "best"}
+                "allow_up": False, "max_up": 1.25, "out_name": OUT_NAME, "quality": "best",
+                "keep_size": False}
 PROFILE_KEYS = list(BUILTIN_VALS)
 
 # ----------------------------------------------------------------- processing
@@ -85,8 +86,9 @@ def mask_from_white(img, tol=12):
     return diff.point(lambda v: 255 if v > tol else 0)
 
 
-def compose(img, mask, W, H, margin):
+def compose(img, mask, W, H, margin, keep_size=False):
     """Cut the product out with its soft mask and center it on a pure white W x H canvas.
+    keep_size: canvas is the photo's own size and the product keeps its original pixels (scale 1).
     Returns (canvas, scale) where scale > 1 means the product had to be enlarged."""
     import numpy as np
     from PIL import ImageFilter
@@ -96,7 +98,11 @@ def compose(img, mask, W, H, margin):
     if not bb:
         return None, None
     l, t, r, b = bb
-    scale = min(W * (1 - 2 * margin) / (r - l), H * (1 - 2 * margin) / (b - t))
+    if keep_size:
+        W, H = img.size
+        scale = 1.0
+    else:
+        scale = min(W * (1 - 2 * margin) / (r - l), H * (1 - 2 * margin) / (b - t))
     pad = 8
     box = (max(l - pad, 0), max(t - pad, 0), min(r + pad, img.width), min(b + pad, img.height))
     size = (max(1, round((box[2] - box[0]) * scale)), max(1, round((box[3] - box[1]) * scale)))
@@ -380,7 +386,7 @@ def process_one(path, folder, s, session, keep_edits=True, times=None):
             if old.exists():
                 old.unlink()
     with timed(times, "edges"):
-        canvas, scale = compose(img, mask, W, H, margin)
+        canvas, scale = compose(img, mask, W, H, margin, s.get("keep_size", False))
     if canvas is None:
         return "No product found", "", None
     with timed(times, "save"):
@@ -971,7 +977,8 @@ class TouchUpWindow(tk.Toplevel):
                     img_used.paste(self.img, self.box[:2])
                 elif rp.exists():
                     rp.unlink()
-                canvas, scale = compose(img_used, full, s["width"], s["height"], s["margin"] / 100)
+                canvas, scale = compose(img_used, full, s["width"], s["height"], s["margin"] / 100,
+                                        s.get("keep_size", False))
                 if canvas is None:
                     messagebox.showerror("Touch up", "Nothing left to save - the whole shoe is erased.", parent=self)
                     return
@@ -1234,19 +1241,27 @@ class App(tk.Tk):
     def ui_values(self, quiet=False):
         """Settings currently shown in the window, or None if a number is invalid."""
         try:
-            w, h, mu = int(self.v_w.get()), int(self.v_h.get()), float(self.v_maxup.get())
-            if w < 100 or h < 100 or mu < 1:
+            keep = bool(self.v_keep.get())
+            mu = float(self.v_maxup.get())
+            if keep:     # size boxes may be blank; remember whatever valid size was there
+                try:
+                    w, h = int(self.v_w.get()), int(self.v_h.get())
+                except ValueError:
+                    w, h = self.s["current"].get("width", 2640), self.s["current"].get("height", 4048)
+            else:
+                w, h = int(self.v_w.get()), int(self.v_h.get())
+            if (not keep and (w < 100 or h < 100)) or mu < 1:
                 raise ValueError
         except ValueError:
             if not quiet:
-                messagebox.showerror(APP, "Output size must be whole numbers (100 or more) and "
-                                          "max enlargement must be 1 or more.")
+                messagebox.showerror(APP, "Output size must be whole numbers (100 or more), or tick "
+                                          "'Keep original size'. Max enlargement must be 1 or more.")
             return None
         name = re.sub(r'[\\/:*?"<>|]', "", self.v_out.get()).strip() or OUT_NAME
         return {"width": w, "height": h, "margin": round(float(self.v_margin.get()), 1),
                 "fmt": self.v_fmt.get(), "remove_bg": bool(self.v_rbg.get()),
                 "allow_up": bool(self.v_up.get()), "max_up": mu, "out_name": name,
-                "quality": self.v_quality.get()}
+                "quality": self.v_quality.get(), "keep_size": keep}
 
     def read_ui_settings(self, quiet=False):
         vals = self.ui_values(quiet)
@@ -1268,8 +1283,20 @@ class App(tk.Tk):
         self.v_maxup.set(str(vals["max_up"]))
         self.v_out.set(vals["out_name"])
         self.v_quality.set(vals.get("quality", "best"))
+        self.v_keep.set(vals.get("keep_size", False))
+        self.toggle_keep()
         self._loading = False
         self.update_dirty()
+
+    def toggle_keep(self):
+        """Keep original size: size boxes and margin don't apply."""
+        if not hasattr(self, "ent_w"):
+            return
+        state = "disabled" if self.v_keep.get() else "normal"
+        for w in (self.ent_w, self.ent_h):
+            w.config(state=state)
+        if hasattr(self, "sc_margin"):
+            self.sc_margin.config(state=state)
 
     def update_dirty(self, *_):
         if getattr(self, "_loading", False) or not hasattr(self, "lbl_dirty"):
@@ -1452,9 +1479,14 @@ class App(tk.Tk):
         sz = ttk.Frame(st)
         sz.grid(row=r, column=1, sticky="w", pady=2)
         self.v_w, self.v_h = tk.StringVar(value=str(cur["width"])), tk.StringVar(value=str(cur["height"]))
-        ttk.Entry(sz, textvariable=self.v_w, width=6).pack(side="left")
+        self.ent_w = ttk.Entry(sz, textvariable=self.v_w, width=6)
+        self.ent_w.pack(side="left")
         ttk.Label(sz, text=" × ").pack(side="left")
-        ttk.Entry(sz, textvariable=self.v_h, width=6).pack(side="left")
+        self.ent_h = ttk.Entry(sz, textvariable=self.v_h, width=6)
+        self.ent_h.pack(side="left")
+        self.v_keep = tk.BooleanVar(value=cur.get("keep_size", False))
+        ttk.Checkbutton(sz, text="Keep original size", variable=self.v_keep,
+                        command=self.toggle_keep).pack(side="left", padx=(10, 0))
 
         r += 1
         ttk.Label(st, text="White margin:").grid(row=r, column=0, sticky="w")
@@ -1462,8 +1494,9 @@ class App(tk.Tk):
         mf.grid(row=r, column=1, sticky="we", pady=2)
         self.v_margin = tk.DoubleVar(value=cur["margin"])
         self.lbl_margin = ttk.Label(mf, width=5)
-        ttk.Scale(mf, from_=0, to=15, variable=self.v_margin, length=180,
-                  command=lambda v: self.lbl_margin.config(text=f"{round(float(v)):.0f}%")).pack(side="left")
+        self.sc_margin = ttk.Scale(mf, from_=0, to=15, variable=self.v_margin, length=180,
+                                   command=lambda v: self.lbl_margin.config(text=f"{round(float(v)):.0f}%"))
+        self.sc_margin.pack(side="left")
         self.lbl_margin.pack(side="left", padx=6)
         self.lbl_margin.config(text=f"{cur['margin']:.0f}%")
 
@@ -1505,7 +1538,9 @@ class App(tk.Tk):
                   foreground="#8a6d00", wraplength=420).grid(row=r + 1, column=0, columnspan=2, sticky="w")
 
         self.refresh_profiles()
-        for v in (self.v_w, self.v_h, self.v_margin, self.v_fmt, self.v_rbg, self.v_up, self.v_maxup, self.v_out, self.v_quality):
+        self.toggle_keep()
+        for v in (self.v_w, self.v_h, self.v_margin, self.v_fmt, self.v_rbg, self.v_up, self.v_maxup, self.v_out,
+                  self.v_quality, self.v_keep):
             v.trace_add("write", self.update_dirty)
         self.update_dirty()
 
