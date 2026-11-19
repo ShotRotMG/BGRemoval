@@ -595,7 +595,10 @@ class TouchUpWindow(tk.Toplevel):
         self.img = self.img_full.crop(self.box)          # work area around the product
         self.mask = self.mask_full.crop(self.box)
         self.orig = self.orig_full.crop(self.box)
-        self._busy = False
+        self._busy = False          # a heal is running
+        self.heal_queue = []        # pending heals: dicts with holes, pend, status, label
+        self._live = None           # heal stroke being painted (work-area L mask)
+        self._qid = 0
         self.undo, self.redo, self.dirty = [], [], False
         self.z, self.vx, self.vy = 1.0, 0.0, 0.0           # zoom and top-left of view (work-area px)
         self._photo, self._job, self._stroke = None, None, None
@@ -642,6 +645,8 @@ class TouchUpWindow(tk.Toplevel):
         ttk.Button(bar, text="Cancel", command=self.close).pack(side="right", padx=8)
         self.lbl_info = ttk.Label(bar, foreground="#666")
         self.lbl_info.pack(side="right", padx=12)
+        self.qbar = ttk.Frame(self, padding=(10, 2, 10, 2))
+        self.qbar.pack(fill="x", side="bottom")
         ttk.Label(self, foreground="#888", padding=(10, 0),
                   text="Left-drag paints  ·  Right-drag or Space+drag pans  ·  Wheel zooms  ·  [ ] brush size  ·  "
                        "E/R/H switch  ·  Ctrl+Z / Ctrl+Y").pack(side="bottom", anchor="w")
@@ -678,6 +683,7 @@ class TouchUpWindow(tk.Toplevel):
         self._space = False
         self.transient(master)
         self.focus_set()
+        self.refresh_queue()
         self.update_info()
 
     # ---- view
@@ -738,6 +744,12 @@ class TouchUpWindow(tk.Toplevel):
             shown = Image.composite(green, Image.composite(im, Image.new("RGB", size, (255, 255, 255)), mk), diff)
         else:
             shown = Image.composite(im, Image.new("RGB", size, (255, 255, 255)), mk)
+        pend = self.pending_mask()
+        if pend is not None:      # queued / in-progress heals, drawn on the photo so they follow pan & zoom
+            pm = pend.crop(box).resize(size, Image.NEAREST)
+            if pm.getbbox():
+                tint = Image.blend(shown, Image.new("RGB", size, (102, 187, 106)), 0.65)
+                shown = Image.composite(tint, shown, pm)
         self._photo = ImageTk.PhotoImage(shown)
         c.create_image(round((box[0] - self.vx) * self.z), round((box[1] - self.vy) * self.z),
                        image=self._photo, anchor="nw", tags="img")
@@ -772,13 +784,11 @@ class TouchUpWindow(tk.Toplevel):
     def stroke_start(self, e):
         if self._space:
             return self.pan_start(e)
-        if self._busy:
-            return
         if self.v_mode.get() == "heal":
             self._stroke = [self.to_img(e)]
-            w = self.v_size.get() * self.z
-            self.canvas.create_oval(e.x - w / 2, e.y - w / 2, e.x + w / 2, e.y + w / 2,
-                                    fill="#66bb6a", outline="", tags="healstroke")
+            self._live = Image.new("L", self.img.size, 0)
+            self.paint_live(self._stroke[0], self._stroke[0])
+            self.schedule(15)
             return
         self._before = self.mask.copy()
         self._stroke = [self.to_img(e)]
@@ -791,17 +801,31 @@ class TouchUpWindow(tk.Toplevel):
         if self._stroke is None:
             return
         p = self.to_img(e)
-        if self.v_mode.get() == "heal":
-            a = self._stroke[-1]
-            self.canvas.create_line((a[0] - self.vx) * self.z, (a[1] - self.vy) * self.z, e.x, e.y,
-                                    fill="#66bb6a", width=self.v_size.get() * self.z, capstyle="round",
-                                    tags="healstroke")
+        if self.v_mode.get() == "heal" and self._live is not None:
+            self.paint_live(self._stroke[-1], p)
             self._stroke.append(p)
-            self.canvas.tag_raise("cursor")
+            self.schedule(25)
             return
         self.paint_segment(self._stroke[-1], p)
         self._stroke.append(p)
         self.schedule(25)
+
+    def paint_live(self, a, b):
+        from PIL import ImageDraw
+        d = ImageDraw.Draw(self._live)
+        w = max(2, round(self.v_size.get()))
+        d.line([a, b], fill=255, width=w)
+        for (x, y) in (a, b):
+            d.ellipse([x - w / 2, y - w / 2, x + w / 2, y + w / 2], fill=255)
+
+    def pending_mask(self):
+        """All queued heals plus the stroke being painted, as one mask (or None)."""
+        from PIL import ImageChops
+        out = self._live
+        for it in self.heal_queue:
+            if not it.get("cancelled"):
+                out = it["pend"] if out is None else ImageChops.lighter(out, it["pend"])
+        return out
 
     def paint_segment(self, a, b):
         from PIL import ImageDraw
@@ -818,9 +842,12 @@ class TouchUpWindow(tk.Toplevel):
             return
         if self._stroke is None:
             return
-        if self.v_mode.get() == "heal":
+        if self.v_mode.get() == "heal" and self._live is not None:
             pts, self._stroke = self._stroke, None
-            return self.start_heal(pts)
+            self.start_heal(pts)
+            self._live = None
+            self.render()
+            return
         from PIL import ImageChops, ImageDraw, ImageFilter
         w, soft = max(1, round(self.v_size.get())), self.v_soft.get()
         xs = [p[0] for p in self._stroke]
@@ -856,7 +883,10 @@ class TouchUpWindow(tk.Toplevel):
         return self.mask if kind == "mask" else self.img
 
     def do_undo(self):
-        if self.undo and not self._busy:
+        if self.undo and self.heal_queue and self.undo[-1][0] == "img":
+            self.lbl_info.config(text="Wait for the heal queue to finish before undoing a heal")
+            return
+        if self.undo:
             kind, bb, patch = self.undo.pop()
             self.redo.append((kind, bb, self._layer(kind).crop(bb)))
             self._layer(kind).paste(patch, bb[:2])
@@ -865,7 +895,10 @@ class TouchUpWindow(tk.Toplevel):
             self.render()
 
     def do_redo(self):
-        if self.redo and not self._busy:
+        if self.redo and self.heal_queue and self.redo[-1][0] == "img":
+            self.lbl_info.config(text="Wait for the heal queue to finish before undoing a heal")
+            return
+        if self.redo:
             kind, bb, patch = self.redo.pop()
             self.undo.append((kind, bb, self._layer(kind).crop(bb)))
             self._layer(kind).paste(patch, bb[:2])
@@ -896,63 +929,119 @@ class TouchUpWindow(tk.Toplevel):
             if hole.getbbox():
                 holes.append(hole)
         if not holes:
-            self.canvas.delete("healstroke")
             return
-        self.run_heal(holes)
+        self.enqueue(holes, "Heal stroke")
 
     def heal_all(self):
-        if self._busy:
-            return
         sens = {"Gentle": 0.8, "Normal": 1.0, "Strong": 1.3}[self.v_strength.get()]
         spots, n = find_wear(self.img, self.mask, sens)
         if n == 0:
             messagebox.showinfo("Heal all wear", "No wear found at this strength. Try Strong, or use the Heal brush.", parent=self)
             return
         groups = spot_groups(spots)
-        self.lbl_info.config(text=f"Found {n} marks…")
-        self.run_heal(groups, after=lambda: (self.v_view.set("healed"), self.render(),
-                                            self.lbl_info.config(text=f"Healed {n} marks - green shows what changed")))
+        self.enqueue(groups, f"Heal all ({n} marks)",
+                     after=lambda: (self.v_view.set("healed"), self.render(),
+                                    self.lbl_info.config(text=f"Healed {n} marks - green shows what changed")))
 
-    def run_heal(self, holes, after=None):
+    def enqueue(self, holes, label, after=None):
+        from PIL import ImageChops
+        pend = holes[0]
+        for h in holes[1:]:
+            pend = ImageChops.lighter(pend, h)
+        self._qid += 1
+        self.heal_queue.append({"id": self._qid, "holes": holes, "pend": pend, "label": label,
+                                "status": "waiting", "after": after, "progress": ""})
+        self.refresh_queue()
+        self.render()
+        if not self._busy:
+            self.start_next()
+
+    def start_next(self):
+        nxt = next((it for it in self.heal_queue if it["status"] == "waiting" and not it.get("cancelled")), None)
+        if nxt is None:
+            self._busy = False
+            self.refresh_queue()
+            self.update_info()
+            if getattr(self, "_save_after", False):
+                self._save_after = False
+                self.save()
+            return
         self._busy = True
-        self.config(cursor="watch")
-        self.lbl_info.config(text="Healing…")
-        work = self.img.copy()
+        nxt["status"] = "working"
+        self.refresh_queue()
+        work = self.img.copy()          # includes every heal finished so far
+        holes = nxt["holes"]
 
         def job():
             try:
-                ensure_heal_model(lambda msg: self.after(0, lambda: self.lbl_info.config(text=msg)))
+                ensure_heal_model(lambda msg: self.after(0, lambda: self.set_progress(nxt, msg)))
                 patches = []
                 for i, hole in enumerate(holes, 1):
-                    self.after(0, lambda i=i: self.lbl_info.config(text=f"Healing… {i}/{len(holes)}"))
+                    if nxt.get("cancelled"):
+                        break
+                    self.after(0, lambda i=i: self.set_progress(nxt, f"{i}/{len(holes)}" if len(holes) > 1 else ""))
                     box, patch = heal_patch(work, hole)
-                    patches.append((box, work.crop(box), patch))
+                    patches.append((box, patch))
                     work.paste(patch, box[:2])
-                self.after(0, lambda: (self.heal_done(patches, None), after and after()))
+                self.after(0, lambda: self.heal_done(nxt, patches, None))
             except Exception as e:
-                self.after(0, lambda e=e: self.heal_done([], e))
+                self.after(0, lambda e=e: self.heal_done(nxt, [], e))
 
         threading.Thread(target=job, daemon=True).start()
 
-    def heal_done(self, patches, err):
-        self._busy = False
+    def set_progress(self, item, text):
+        item["progress"] = text
+        self.refresh_queue()
+
+    def heal_done(self, item, patches, err):
         try:
-            self.config(cursor="")
+            self.winfo_exists()
         except tk.TclError:
             return
-        self.canvas.delete("healstroke")
+        if item in self.heal_queue:
+            self.heal_queue.remove(item)
         if err:
             messagebox.showerror("Heal", f"Heal didn't work:\n{err}", parent=self)
-        if patches:   # one undo step for the whole stroke
+        if patches and not item.get("cancelled"):   # one undo step per queue item
             ub = (min(p[0][0] for p in patches), min(p[0][1] for p in patches),
                   max(p[0][2] for p in patches), max(p[0][3] for p in patches))
             self.undo.append(("img", ub, self.img.crop(ub)))
-            for box, before, patch in patches:
+            for box, patch in patches:
                 self.img.paste(patch, box[:2])
             self.redo.clear()
             self.dirty = True
+            if item.get("after"):
+                item["after"]()
         self.update_info()
         self.render()
+        self.start_next()
+
+    def cancel_heal(self, item):
+        item["cancelled"] = True
+        if item["status"] == "waiting" and item in self.heal_queue:
+            self.heal_queue.remove(item)
+        self.refresh_queue()
+        self.render()
+
+    def refresh_queue(self):
+        for w in self.qbar.winfo_children():
+            w.destroy()
+        items = [it for it in self.heal_queue if not it.get("cancelled")]
+        ttk.Label(self.qbar, text="Heal queue:", font=("Segoe UI", 9, "bold")).pack(side="left")
+        if not items:
+            ttk.Label(self.qbar, text="empty - paint with Heal (H); strokes queue up while others run",
+                      foreground="#888").pack(side="left", padx=6)
+            return
+        for n, it in enumerate(items, 1):
+            chip = tk.Frame(self.qbar, bg="#e8f5e9" if it["status"] == "working" else "#eeeeee",
+                            highlightthickness=1, highlightbackground="#bdbdbd")
+            chip.pack(side="left", padx=4)
+            state = "working" + (f" {it['progress']}" if it["progress"] else "…") if it["status"] == "working" else "waiting"
+            tk.Label(chip, text=f"{n}. {it['label']} - {state}", bg=chip["bg"]).pack(side="left", padx=(6, 2))
+            tk.Button(chip, text="✕", relief="flat", bg=chip["bg"], bd=0, cursor="hand2",
+                      command=lambda it=it: self.cancel_heal(it)).pack(side="left", padx=(0, 4))
+        if getattr(self, "_save_after", False):
+            ttk.Label(self.qbar, text="→ saves when done", foreground="#1e88e5").pack(side="left", padx=6)
 
     def reset_ai(self):
         if not messagebox.askyesno("Touch up", "Throw away all touch-ups on this photo and go back to the "
@@ -963,7 +1052,10 @@ class TouchUpWindow(tk.Toplevel):
 
     # ---- save / close
     def save(self):
-        if self._busy:
+        if self.heal_queue:
+            self._save_after = True
+            self.refresh_queue()
+            self.lbl_info.config(text="Will save when the heal queue finishes")
             return
         s = dict(self.app.s["current"])
         self.config(cursor="watch")
