@@ -568,6 +568,54 @@ def spot_groups(spots, tile=384):
     return out
 
 
+def fix_bleed(img, mask, region=None, stripes=False):
+    """Remove color that has bled onto white/light parts (dye transfer, colored haze around stripes).
+    Light pixels get the rubber's own base tint back, keeping their brightness and texture.
+    Strong colors (stripes, canvas) are protected. region (L): only fix there (brush); None = auto
+    near strong colors. Returns (new RGB image, bbox of changed area or None, pixels changed)."""
+    import cv2
+    import numpy as np
+    a = np.asarray(img).astype(np.float32)
+    lum = a @ np.array([0.299, 0.587, 0.114], np.float32)
+    c = a - lum[..., None]                                  # chroma part of each pixel
+    sat = a.max(2) - a.min(2)
+    m = np.asarray(mask) > 128
+    light = lum > 110
+    ref = m & light & (sat < 25)
+    base = np.median(c[ref], axis=0) if ref.sum() > 500 else np.zeros(3, np.float32)
+    dev = np.linalg.norm(c - base, axis=2)
+    k = max(5, int(max(m.shape) * 0.004)) | 1
+    ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    strong = m & (sat > 60)
+    if not stripes and region is None:   # only big colored areas (canvas, upper), not thin stripes or trims
+        kt = max(7, int(max(m.shape) * 0.01)) | 1
+        strong = cv2.morphologyEx(strong.astype(np.uint8), cv2.MORPH_OPEN,
+                                  cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kt, kt))) > 0
+    # brightness of the nearby real color (stripe/canvas); bleed is clearly lighter than its source
+    src = cv2.erode(np.where(strong, lum, 255).astype(np.float32), ker)
+    lighter = np.clip((lum - (src + 22)) / 18, 0, 1)        # 0 = as dark as the color, 1 = clearly lighter
+    weak = np.clip((75 - sat) / 20, 0, 1)                  # 1 = barely colored
+    w = np.maximum(weak, lighter)
+    if region is not None:
+        target = (np.asarray(region) > 0) & m & light & (dev > 3)
+    else:
+        near_color = cv2.dilate(strong.astype(np.uint8), ker) > 0
+        kw = max(11, int(max(m.shape) * 0.008)) | 1         # bleed bands can be a few px wide
+        near_white = cv2.dilate((m & light & (dev < 6)).astype(np.uint8),
+                                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kw, kw))) > 0
+        target = m & light & (dev > 5) & near_color & near_white
+    if not target.any():
+        return img, None, 0
+    w = w * target
+    w = cv2.GaussianBlur(w.astype(np.float32), (0, 0), 0.8) * m
+    new = lum[..., None] + base
+    out = a * (1 - w[..., None]) + new * w[..., None]
+    changed = w > 0.02
+    ys, xs = np.nonzero(changed)
+    bb = (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+    return Image.fromarray(np.clip(out + 0.5, 0, 255).astype(np.uint8)), bb, int(changed.sum())
+
+
 # ------------------------------------------------------------ touch-up editor
 
 
@@ -610,7 +658,8 @@ class TouchUpWindow(tk.Toplevel):
         self.v_mode = tk.StringVar(value="erase")
         ttk.Radiobutton(tb, text="Erase (E)", value="erase", variable=self.v_mode, command=self.draw_cursor).pack(side="left")
         ttk.Radiobutton(tb, text="Restore (R)", value="restore", variable=self.v_mode, command=self.draw_cursor).pack(side="left", padx=8)
-        ttk.Radiobutton(tb, text="Heal (H)", value="heal", variable=self.v_mode, command=self.draw_cursor).pack(side="left", padx=(0, 16))
+        ttk.Radiobutton(tb, text="Heal (H)", value="heal", variable=self.v_mode, command=self.draw_cursor).pack(side="left", padx=(0, 8))
+        ttk.Radiobutton(tb, text="Bleed (D)", value="bleed", variable=self.v_mode, command=self.draw_cursor).pack(side="left", padx=(0, 16))
         ttk.Label(tb, text="Brush").pack(side="left")
         self.v_size = tk.DoubleVar(value=40)
         ttk.Scale(tb, from_=2, to=400, variable=self.v_size, length=150,
@@ -628,6 +677,9 @@ class TouchUpWindow(tk.Toplevel):
         tb2 = ttk.Frame(self, padding=(10, 0, 10, 6))
         tb2.pack(fill="x")
         ttk.Button(tb2, text="✨ Heal all wear (auto)", command=self.heal_all).pack(side="left")
+        ttk.Button(tb2, text="🎨 Fix color bleed (auto)", command=self.bleed_all).pack(side="left", padx=(6, 0))
+        self.v_stripes = tk.BooleanVar(value=False)
+        ttk.Checkbutton(tb2, text="incl. stripe edges", variable=self.v_stripes).pack(side="left", padx=(4, 0))
         ttk.Label(tb2, text="Strength").pack(side="left", padx=(10, 4))
         self.v_strength = tk.StringVar(value="Normal")
         ttk.Combobox(tb2, textvariable=self.v_strength, values=["Gentle", "Normal", "Strong"], state="readonly",
@@ -650,7 +702,7 @@ class TouchUpWindow(tk.Toplevel):
         self.qbar.pack(fill="x", side="bottom")
         ttk.Label(self, foreground="#888", padding=(10, 0),
                   text="Left-drag paints  ·  Right-drag or Space+drag pans  ·  Wheel zooms  ·  [ ] brush size  ·  "
-                       "E/R/H switch  ·  B before/after  ·  G healed  ·  Ctrl+Z / Ctrl+Y").pack(side="bottom", anchor="w")
+                       "E/R/H/D switch  ·  B before/after  ·  G healed  ·  Ctrl+Z / Ctrl+Y").pack(side="bottom", anchor="w")
 
         self.canvas = tk.Canvas(self, bg="#9a9a9a", highlightthickness=0, cursor="none")
         self.canvas.pack(fill="both", expand=True, padx=10)
@@ -673,6 +725,7 @@ class TouchUpWindow(tk.Toplevel):
         self.bind("<Key-e>", lambda e: (self.v_mode.set("erase"), self.draw_cursor()))
         self.bind("<Key-r>", lambda e: (self.v_mode.set("restore"), self.draw_cursor()))
         self.bind("<Key-h>", lambda e: (self.v_mode.set("heal"), self.draw_cursor()))
+        self.bind("<Key-d>", lambda e: (self.v_mode.set("bleed"), self.draw_cursor()))
         self.bind("<Key-b>", lambda e: (self.v_view.set("before" if self.v_view.get() != "before" else "result"), self.render()))
         self.bind("<Key-g>", lambda e: (self.v_view.set("healed" if self.v_view.get() != "healed" else "result"), self.render()))
         self.bind("<Key-bracketleft>", lambda e: self.set_size(self.v_size.get() / 1.25))
@@ -768,7 +821,7 @@ class TouchUpWindow(tk.Toplevel):
         x, y = self._mouse
         r = self.v_size.get() * self.z / 2
         c.delete("cursor")
-        color = {"erase": "#d32f2f", "restore": "#1e88e5", "heal": "#2e7d32"}[self.v_mode.get()]
+        color = {"erase": "#d32f2f", "restore": "#1e88e5", "heal": "#2e7d32", "bleed": "#8e24aa"}[self.v_mode.get()]
         c.create_oval(x - r, y - r, x + r, y + r, outline=color, width=2, tags="cursor")
         c.create_oval(x - r - 1, y - r - 1, x + r + 1, y + r + 1, outline="white", width=1, tags="cursor")
 
@@ -788,7 +841,10 @@ class TouchUpWindow(tk.Toplevel):
     def stroke_start(self, e):
         if self._space:
             return self.pan_start(e)
-        if self.v_mode.get() == "heal":
+        if self.v_mode.get() in ("heal", "bleed"):
+            if self.v_mode.get() == "bleed" and self.heal_queue:
+                self.lbl_info.config(text="Wait for the heal queue to finish before fixing bleed")
+                return
             self._stroke = [self.to_img(e)]
             self._live = Image.new("L", self.img.size, 0)
             self.paint_live(self._stroke[0], self._stroke[0])
@@ -805,7 +861,7 @@ class TouchUpWindow(tk.Toplevel):
         if self._stroke is None:
             return
         p = self.to_img(e)
-        if self.v_mode.get() == "heal" and self._live is not None:
+        if self.v_mode.get() in ("heal", "bleed") and self._live is not None:
             self.paint_live(self._stroke[-1], p)
             self._stroke.append(p)
             self.schedule(25)
@@ -845,6 +901,10 @@ class TouchUpWindow(tk.Toplevel):
             self._pan = None
             return
         if self._stroke is None:
+            return
+        if self.v_mode.get() == "bleed" and self._live is not None:
+            region, self._live, self._stroke = self._live, None, None
+            self.apply_bleed(region)
             return
         if self.v_mode.get() == "heal" and self._live is not None:
             pts, self._stroke = self._stroke, None
@@ -935,6 +995,32 @@ class TouchUpWindow(tk.Toplevel):
         if not holes:
             return
         self.enqueue(holes, "Heal stroke")
+
+    def apply_bleed(self, region=None):
+        """Remove color bleed: in the painted region, or automatically along colored edges."""
+        if self.heal_queue:
+            self.lbl_info.config(text="Wait for the heal queue to finish before fixing bleed")
+            self.render()
+            return
+        new, bb, n = fix_bleed(self.img, self.mask, region, stripes=bool(self.v_stripes.get()))
+        if bb is None:
+            self.render()
+            if region is None:
+                messagebox.showinfo("Fix color bleed", "No color bleed found. You can paint over any spot "
+                                                      "with the Bleed brush (D).", parent=self)
+            return
+        self.undo.append(("img", bb, self.img.crop(bb)))
+        self.img.paste(new.crop(bb), bb[:2])
+        self.redo.clear()
+        self.dirty = True
+        self.update_info()
+        if region is None:
+            self.v_view.set("healed")
+            self.lbl_info.config(text=f"Fixed bleed on {n:,} pixels - green shows what changed")
+        self.render()
+
+    def bleed_all(self):
+        self.apply_bleed(None)
 
     def heal_all(self):
         sens = {"Gentle": 0.8, "Normal": 1.0, "Strong": 1.3}[self.v_strength.get()]
