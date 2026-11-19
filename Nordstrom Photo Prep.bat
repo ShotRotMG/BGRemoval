@@ -318,8 +318,38 @@ def match_saved_rotation(folder, path, img):
 
     op = max((Image.Transpose.ROTATE_90, Image.Transpose.ROTATE_270), key=score)
     mask.transpose(op).save(mp, compress_level=1)
-    if rp.exists():
-        Image.open(rp).transpose(op).save(rp, compress_level=6)
+
+
+def match_retouch_orientation(folder, path, img):
+    """Turn the saved healed pixels to whichever orientation blends into the photo at the patch
+    borders (a correctly placed heal fades into the original there). Fixes heals that were saved
+    sideways or upside down relative to the photo."""
+    import cv2
+    import numpy as np
+    rp = retouch_path(folder, path)
+    if not rp.exists():
+        return
+    layer = Image.open(rp).convert("RGBA")
+    ops = [None, Image.Transpose.ROTATE_90, Image.Transpose.ROTATE_180, Image.Transpose.ROTATE_270]
+    cands = [(op, layer if op is None else layer.transpose(op)) for op in ops]
+    cands = [(op, c) for op, c in cands if c.size == img.size]
+    if not cands:
+        return
+    photo = np.asarray(img).astype(np.int16)
+
+    def misfit(c):
+        a = np.asarray(c)
+        sel = (a[..., 3] > 0).astype(np.uint8)
+        ring = (sel - cv2.erode(sel, np.ones((5, 5), np.uint8))) > 0
+        if not ring.any():
+            return 0.0
+        return float(np.abs(a[..., :3][ring].astype(np.int16) - photo[ring]).mean())
+
+    scores = [(misfit(c), op, c) for op, c in cands]
+    best = min(scores, key=lambda t: t[0])
+    current = next((t for t in scores if t[1] is None), None)
+    if best[1] is not None and (current is None or best[0] < current[0] * 0.5):
+        best[2].save(rp, compress_level=6)
 
 
 def process_one(path, folder, s, session, keep_edits=True, times=None):
@@ -331,6 +361,7 @@ def process_one(path, folder, s, session, keep_edits=True, times=None):
     mask, note = None, ""
     if keep_edits and flag.exists() and mp.exists():
         match_saved_rotation(folder, path, img)
+        match_retouch_orientation(folder, path, img)
         mask = Image.open(mp).convert("L")
         if mask.size == img.size:
             note = "touched up"
@@ -530,6 +561,7 @@ class TouchUpWindow(tk.Toplevel):
 
         self.orig_full = load_source(self.src)
         match_saved_rotation(self.folder, self.src, self.orig_full)
+        match_retouch_orientation(self.folder, self.src, self.orig_full)
         self.img_full = apply_retouch(self.orig_full, self.folder, self.src)
         self.mask_full = Image.open(mask_path(self.folder, self.src)).convert("L")
         bb = self.mask_full.point(lambda a: 255 if a > 40 else 0).getbbox() or (0, 0, *self.img_full.size)
